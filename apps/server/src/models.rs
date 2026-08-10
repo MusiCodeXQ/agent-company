@@ -83,13 +83,16 @@ pub struct Employee {
     pub department: String,
     pub title: String,
     pub status: String,
+    pub employment_status: String,
     pub personality: PersonalityProfile,
     pub skills: Vec<SkillProfile>,
     pub appearance: AppearanceProfile,
     pub model_config: AgentModelConfig,
     pub model_profile_id: Option<String>,
     pub model_profile: Option<ModelProfileSummary>,
+    pub runtime_binding: Option<RuntimeBindingSummary>,
     pub desk_id: Option<String>,
+    pub floor_id: Option<String>,
     pub hired_at: String,
     pub current_state: String,
     pub current_destination: Option<Value>,
@@ -119,6 +122,86 @@ pub struct TaskSummary {
     pub status: String,
     pub assignee_id: Option<String>,
     pub goal_id: Option<String>,
+    pub previous_assignee_id: Option<String>,
+    pub handover_status: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeBindingSummary {
+    pub id: String,
+    pub employee_id: String,
+    pub runtime_type: String,
+    pub runtime_agent_id: String,
+    pub runtime_profile_id: Option<String>,
+    pub workspace_path: String,
+    pub agent_dir: Option<String>,
+    pub provision_status: String,
+    pub runtime_status: String,
+    pub last_health_at: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenClawStatus {
+    pub enabled: bool,
+    pub configured: bool,
+    pub gateway_url: String,
+    pub reachable: bool,
+    pub protocol: Option<i64>,
+    pub version: Option<String>,
+    pub last_error: Option<String>,
+    pub checked_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminationTaskSummary {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub goal_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminationPreview {
+    pub employee: Employee,
+    pub active_task_count: i64,
+    pub running_job_count: i64,
+    pub active_goal_count: i64,
+    pub active_meeting_count: i64,
+    pub artifact_count: i64,
+    pub workspace_path: Option<String>,
+    pub workspace_status: String,
+    pub runtime_type: String,
+    pub runtime_status: String,
+    pub workstation_id: Option<String>,
+    pub unread_count: i64,
+    pub tasks: Vec<TerminationTaskSummary>,
+    pub active_termination_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminationRecordSummary {
+    pub id: String,
+    pub company_id: String,
+    pub employee_id: String,
+    pub initiated_by: String,
+    pub reason: String,
+    pub notes: String,
+    pub status: String,
+    pub workspace_action: String,
+    pub task_handover_status: String,
+    pub runtime_shutdown_status: String,
+    pub workstation_release_status: String,
+    pub created_at: String,
+    pub effective_at: Option<String>,
+    pub completed_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -176,6 +259,8 @@ pub struct MessageRecord {
     pub created_at: String,
     pub read_at: Option<String>,
     pub job_id: Option<String>,
+    pub meeting_id: Option<String>,
+    pub broadcast_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -199,6 +284,7 @@ pub struct AgentJobSummary {
     pub message_id: Option<String>,
     pub goal_id: Option<String>,
     pub task_id: Option<String>,
+    pub meeting_id: Option<String>,
     pub attempts: i64,
     pub result: Option<String>,
     pub error: Option<String>,
@@ -248,6 +334,107 @@ pub struct AgentMovementSummary {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FloorSummary {
+    pub id: String,
+    pub company_id: String,
+    pub floor_number: i64,
+    pub name: String,
+    pub description: String,
+    pub mission: String,
+    pub responsibilities: Vec<String>,
+    pub roles: Vec<FloorRoleSummary>,
+    pub status: String,
+    pub employee_count: i64,
+    pub workstation_count: i64,
+    pub available_workstations: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloorRoleSummary {
+    pub id: String,
+    pub name: String,
+    pub responsibilities: Vec<String>,
+    pub skills: Vec<String>,
+    pub preferences: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkstationSummary {
+    pub id: String,
+    pub company_id: String,
+    pub floor_id: String,
+    pub location_id: String,
+    pub room_id: Option<String>,
+    pub x: f32,
+    pub y: f32,
+    pub orientation: String,
+    pub status: String,
+    pub assigned_employee_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HiringPositionSummary {
+    pub id: String,
+    pub role_definition_id: Option<String>,
+    pub title: String,
+    pub headcount: i64,
+    pub requirements: Vec<String>,
+    pub preferences: Vec<String>,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateSummary {
+    pub id: String,
+    pub hiring_request_id: String,
+    pub position_id: String,
+    pub name: String,
+    pub age: u8,
+    pub gender: String,
+    pub title: String,
+    pub personality: PersonalityProfile,
+    pub skills: Vec<SkillProfile>,
+    pub work_style: String,
+    pub strengths: Vec<String>,
+    pub weaknesses: Vec<String>,
+    pub expertise: Vec<String>,
+    pub expected_model: String,
+    pub agent_runtime: String,
+    pub appearance: AppearanceProfile,
+    pub match_score: i64,
+    pub interview_evaluation: String,
+    pub status: String,
+    pub hired_employee_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HiringRequestSummary {
+    pub id: String,
+    pub company_id: String,
+    pub floor_id: String,
+    pub requester_id: Option<String>,
+    pub summary: String,
+    pub status: String,
+    pub source_message_id: Option<String>,
+    pub positions: Vec<HiringPositionSummary>,
+    pub candidates: Vec<CandidateSummary>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DomainEvent {
     pub event_id: String,
     pub company_id: String,
@@ -267,7 +454,10 @@ pub struct CompanySnapshot {
     pub goals: Vec<GoalSummary>,
     pub tasks: Vec<TaskSummary>,
     pub meetings: Vec<MeetingSummary>,
-    pub hiring_requests: Vec<Value>,
+    pub floors: Vec<FloorSummary>,
+    pub active_floor_id: String,
+    pub workstations: Vec<WorkstationSummary>,
+    pub hiring_requests: Vec<HiringRequestSummary>,
     pub messages: Vec<MessageRecord>,
     pub unread_counts: HashMap<String, i64>,
     pub jobs: Vec<AgentJobSummary>,
@@ -278,6 +468,7 @@ pub struct CompanySnapshot {
     pub token_usage: TokenUsageSummary,
     pub server_time: String,
     pub recent_events: Vec<DomainEvent>,
+    pub openclaw: OpenClawStatus,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -327,6 +518,48 @@ pub struct MeetingInput {
 pub struct MoveAgentInput {
     pub destination_location_id: String,
     pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloorInput {
+    pub name: String,
+    pub description: Option<String>,
+    pub mission: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloorUpdateInput {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub mission: Option<String>,
+    pub responsibilities: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkstationInput {
+    pub x: Option<f32>,
+    pub y: Option<f32>,
+    pub room_id: Option<String>,
+    pub orientation: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HireCandidateInput {
+    pub candidate_id: String,
+    pub workstation_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminationInput {
+    pub reason: Option<String>,
+    pub notes: Option<String>,
+    pub task_action: Option<String>,
+    pub workspace_action: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -3,6 +3,8 @@ use serde::Serialize;
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfficeLayout {
+    pub floor_id: Option<String>,
+    pub floor_name: Option<String>,
     pub width: u32,
     pub height: u32,
     pub rooms: Vec<RoomDefinition>,
@@ -14,6 +16,16 @@ pub struct OfficeLayout {
     pub navigation_obstacles: Vec<Rect>,
     pub locations: Vec<LocationDefinition>,
     pub movement: MovementConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkstationLayoutInput {
+    pub id: String,
+    pub location_id: String,
+    pub assigned_employee_id: Option<String>,
+    pub room_id: Option<String>,
+    pub x: f32,
+    pub y: f32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -305,6 +317,8 @@ pub fn default_office() -> OfficeLayout {
     let locations = default_locations(&desks, &seats, &doors, &spawn_points);
 
     OfficeLayout {
+        floor_id: None,
+        floor_name: None,
         width: 1600,
         height: 900,
         rooms,
@@ -319,6 +333,157 @@ pub fn default_office() -> OfficeLayout {
             base_speed: 120.0,
             grid_cell_size: 20,
         },
+    }
+}
+
+/// Build the observable layout for a persisted floor. Rooms/furniture are a
+/// reusable base map; desks are data rows from `workstations`, so a new floor
+/// starts empty and can grow without adding a Rust or React role enum.
+pub fn office_for_floor(
+    floor_id: &str,
+    floor_name: &str,
+    workstations: &[WorkstationLayoutInput],
+) -> OfficeLayout {
+    let mut layout = default_office();
+    layout.floor_id = Some(floor_id.to_string());
+    layout.floor_name = Some(floor_name.to_string());
+
+    // The base map contains example desk locations for the original demo. The
+    // persisted workstation rows are authoritative for every floor.
+    layout.desks.clear();
+    layout.seats.retain(|seat| seat.kind != "desk");
+    layout
+        .locations
+        .retain(|location| location.location_type != "WORKSTATION");
+
+    if floor_id != "floor-01" {
+        prefix_floor_layout(&mut layout, floor_id);
+    }
+
+    for workstation in workstations {
+        let room_id = workstation
+            .room_id
+            .clone()
+            .unwrap_or_else(|| floor_room_id(floor_id, "open-office"));
+        let seat_id = format!("{}-seat", workstation.id);
+        let employee_id = workstation
+            .assigned_employee_id
+            .clone()
+            .unwrap_or_else(|| "unassigned".to_string());
+        layout.desks.push(DeskDefinition {
+            id: workstation.id.clone(),
+            employee_id: employee_id.clone(),
+            x: workstation.x.round().max(0.0) as u32,
+            y: workstation.y.round().max(0.0) as u32,
+            width: 160,
+            height: 82,
+            seat_id: seat_id.clone(),
+            monitor_x: workstation.x.round().max(0.0) as u32 + 58,
+            monitor_y: workstation.y.round().max(0.0) as u32 + 14,
+        });
+        layout.seats.push(SeatDefinition {
+            id: seat_id,
+            kind: "desk".to_string(),
+            x: (workstation.x + 80.0).round().max(0.0) as u32,
+            y: (workstation.y + 108.0).round().max(0.0) as u32,
+            room_id: Some(room_id.clone()),
+            employee_id: workstation.assigned_employee_id.clone(),
+            desk_id: Some(workstation.id.clone()),
+        });
+        layout.locations.push(LocationDefinition {
+            id: workstation.location_id.clone(),
+            name: format!("{} 工位", workstation.id),
+            location_type: "WORKSTATION".to_string(),
+            room_id: Some(room_id),
+            x: workstation.x + 80.0,
+            y: workstation.y + 108.0,
+        });
+    }
+    layout.navigation_obstacles = layout
+        .desks
+        .iter()
+        .map(|desk| Rect {
+            x: desk.x,
+            y: desk.y,
+            width: desk.width,
+            height: desk.height + 14,
+        })
+        .chain(layout.furniture.iter().map(|item| Rect {
+            x: item.x,
+            y: item.y,
+            width: item.width,
+            height: item.height,
+        }))
+        .collect();
+    layout
+}
+
+/// Locations used when a newly created floor is initialized. The ids are
+/// floor-scoped except for the original F1 compatibility map.
+pub fn floor_locations(floor_id: &str) -> Vec<LocationDefinition> {
+    let base = default_office();
+    base.locations
+        .into_iter()
+        .filter(|location| location.location_type != "WORKSTATION")
+        .map(|mut location| {
+            if floor_id != "floor-01" {
+                location.id = floor_location_id(floor_id, &location.id);
+                location.room_id = location
+                    .room_id
+                    .as_deref()
+                    .map(|room_id| floor_room_id(floor_id, room_id));
+            }
+            location
+        })
+        .collect()
+}
+
+pub fn floor_location_id(floor_id: &str, location_id: &str) -> String {
+    if floor_id == "floor-01" {
+        location_id.to_string()
+    } else {
+        format!("{floor_id}__{location_id}")
+    }
+}
+
+pub fn floor_room_id(floor_id: &str, room_id: &str) -> String {
+    if floor_id == "floor-01" {
+        room_id.to_string()
+    } else {
+        format!("{floor_id}__{room_id}")
+    }
+}
+
+fn prefix_floor_layout(layout: &mut OfficeLayout, floor_id: &str) {
+    for room in &mut layout.rooms {
+        room.id = floor_room_id(floor_id, &room.id);
+        if room.room_type == "office" && room.label == "HR 办公室" {
+            room.label = "空置办公室".to_string();
+        }
+    }
+    for door in &mut layout.doors {
+        door.id = format!("{floor_id}__{}", door.id);
+        door.room_id = floor_room_id(floor_id, &door.room_id);
+    }
+    for seat in &mut layout.seats {
+        seat.id = format!("{floor_id}__{}", seat.id);
+        seat.room_id = seat
+            .room_id
+            .as_deref()
+            .map(|room_id| floor_room_id(floor_id, room_id));
+    }
+    for furniture in &mut layout.furniture {
+        furniture.id = format!("{floor_id}__{}", furniture.id);
+    }
+    for point in &mut layout.spawn_points {
+        point.id = format!("{floor_id}__{}", point.id);
+    }
+    for location in &mut layout.locations {
+        location.id = floor_location_id(floor_id, &location.id);
+        location.room_id = location
+            .room_id
+            .as_deref()
+            .map(|room_id| floor_room_id(floor_id, room_id));
     }
 }
 

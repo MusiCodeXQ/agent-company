@@ -3,10 +3,16 @@ import type {
   AgentJobSummary,
   CompanySnapshot,
   DomainEvent,
+  FloorSummary,
+  HiringRequestSummary,
   MessageRecord,
   ModelProfileSummary,
+  OpenClawStatus,
   Employee,
   MeetingSummary,
+  TerminationPreview,
+  TerminationRecordSummary,
+  WorkstationSummary,
 } from '../domain/types';
 
 const COMPANY_ID = 'company-01';
@@ -15,6 +21,14 @@ export const EMPLOYEE_MESSAGE_PAGE_SIZE = 40;
 export interface MessageSendResponse {
   message: MessageRecord;
   jobId: string;
+  status: string;
+}
+
+export interface MeetingMessageSendResponse {
+  meetingId: string;
+  broadcastId: string;
+  messages: MessageRecord[];
+  jobIds: string[];
   status: string;
 }
 
@@ -42,6 +56,46 @@ export interface MeetingInput {
   meetingType?: string;
 }
 
+export interface FloorInput {
+  name: string;
+  description?: string;
+  mission?: string;
+}
+
+export interface FloorUpdateInput {
+  name?: string;
+  description?: string;
+  mission?: string;
+  responsibilities?: string[];
+}
+
+export interface WorkstationInput {
+  x?: number;
+  y?: number;
+  roomId?: string;
+  orientation?: string;
+}
+
+export interface HireCandidateInput {
+  candidateId: string;
+  workstationId?: string;
+}
+
+export interface HireCandidateResponse {
+  employee: Employee;
+  movement?: unknown;
+  floorId: string;
+  workstationId: string;
+  status: string;
+}
+
+export interface TerminationInput {
+  reason?: string;
+  notes?: string;
+  taskAction?: 'REASSIGN' | 'PAUSE' | 'CANCEL';
+  workspaceAction?: 'ARCHIVE' | 'READ_ONLY';
+}
+
 async function readError(response: Response, fallback: string): Promise<Error> {
   try {
     const body = await response.json() as { error?: string };
@@ -51,13 +105,65 @@ async function readError(response: Response, fallback: string): Promise<Error> {
   }
 }
 
-export async function fetchSnapshot(): Promise<CompanySnapshot> {
-  const response = await fetch('/api/company/snapshot');
+export async function fetchSnapshot(floorId?: string): Promise<CompanySnapshot> {
+  const query = floorId ? `?floorId=${encodeURIComponent(floorId)}` : '';
+  const response = await fetch(`/api/company/snapshot${query}`);
   if (!response.ok) throw await readError(response, 'Snapshot request failed');
   return response.json() as Promise<CompanySnapshot>;
 }
 
 export const fetchBootstrap = fetchSnapshot;
+
+export async function createFloor(input: FloorInput): Promise<FloorSummary> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/floors`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw await readError(response, 'Floor creation failed');
+  return response.json() as Promise<FloorSummary>;
+}
+
+export async function updateFloor(floorId: string, input: FloorUpdateInput): Promise<FloorSummary> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/floors/${encodeURIComponent(floorId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw await readError(response, 'Floor update failed');
+  return response.json() as Promise<FloorSummary>;
+}
+
+export async function deleteFloor(floorId: string): Promise<void> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/floors/${encodeURIComponent(floorId)}`, { method: 'DELETE' });
+  if (!response.ok) throw await readError(response, 'Floor deletion failed');
+}
+
+export async function createWorkstation(floorId: string, input: WorkstationInput = {}): Promise<WorkstationSummary> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/floors/${encodeURIComponent(floorId)}/workstations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw await readError(response, 'Workstation creation failed');
+  return response.json() as Promise<WorkstationSummary>;
+}
+
+export async function hireCandidate(requestId: string, input: HireCandidateInput): Promise<HireCandidateResponse> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/hiring-requests/${encodeURIComponent(requestId)}/hire`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw await readError(response, 'Candidate hiring failed');
+  return response.json() as Promise<HireCandidateResponse>;
+}
+
+export async function fetchHiringRequests(): Promise<HiringRequestSummary[]> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/hiring-requests`);
+  if (!response.ok) throw await readError(response, 'Hiring request fetch failed');
+  return response.json() as Promise<HiringRequestSummary[]>;
+}
 
 export async function listModelProfiles(): Promise<ModelProfileSummary[]> {
   const response = await fetch('/api/model-profiles');
@@ -89,6 +195,34 @@ export async function testModelProfile(profileId: string): Promise<{ ok: boolean
   const response = await fetch(`/api/model-profiles/${encodeURIComponent(profileId)}/test`, { method: 'POST' });
   if (!response.ok) throw await readError(response, 'Provider connection test failed');
   return response.json() as Promise<{ ok: boolean; message: string }>;
+}
+
+export async function fetchOpenClawStatus(): Promise<OpenClawStatus> {
+  const response = await fetch('/api/openclaw/status');
+  if (!response.ok) throw await readError(response, 'OpenClaw status request failed');
+  return response.json() as Promise<OpenClawStatus>;
+}
+
+export async function fetchTerminationPreview(employeeId: string): Promise<TerminationPreview> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/employees/${encodeURIComponent(employeeId)}/termination-preview`);
+  if (!response.ok) throw await readError(response, 'Termination preview request failed');
+  return response.json() as Promise<TerminationPreview>;
+}
+
+export async function terminateEmployee(employeeId: string, input: TerminationInput): Promise<TerminationRecordSummary> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/employees/${encodeURIComponent(employeeId)}/terminate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw await readError(response, 'Employee termination failed');
+  return response.json() as Promise<TerminationRecordSummary>;
+}
+
+export async function provisionEmployeeRuntime(employeeId: string): Promise<Employee> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/employees/${encodeURIComponent(employeeId)}/runtime/provision`, { method: 'POST' });
+  if (!response.ok) throw await readError(response, 'OpenClaw runtime provisioning failed');
+  return response.json() as Promise<Employee>;
 }
 
 export async function sendCompanyMessage(content: string, employeeId?: string): Promise<MessageSendResponse> {
@@ -131,6 +265,16 @@ export async function sendEmployeeMessage(employeeId: string, content: string): 
   });
   if (!response.ok) throw await readError(response, 'Agent message request failed');
   return response.json() as Promise<MessageSendResponse>;
+}
+
+export async function sendMeetingMessage(meetingId: string, content: string): Promise<MeetingMessageSendResponse> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/meetings/${encodeURIComponent(meetingId)}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  });
+  if (!response.ok) throw await readError(response, 'Meeting message request failed');
+  return response.json() as Promise<MeetingMessageSendResponse>;
 }
 
 export async function markEmployeeMessagesRead(employeeId: string): Promise<void> {

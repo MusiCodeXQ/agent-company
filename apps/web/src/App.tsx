@@ -6,13 +6,19 @@ import type {
   ActorState,
   AgentJobSummary,
   AgentMemoryRecord,
+  CandidateSummary,
   DomainEvent,
   Employee,
+  FloorSummary,
+  HiringRequestSummary,
+  MeetingSummary,
   MessageRecord,
   ModelProfileSummary,
+  OpenClawStatus,
   TokenUsageSummary,
+  TerminationPreview,
 } from './domain/types';
-import { EMPLOYEE_MESSAGE_PAGE_SIZE, type ModelProfileInput } from './api/client';
+import { EMPLOYEE_MESSAGE_PAGE_SIZE, type ModelProfileInput, type TerminationInput } from './api/client';
 
 const STATE_LABELS: Record<ActorState, string> = {
   idle: '待命',
@@ -60,19 +66,34 @@ export function App(): ReactElement {
   const loading = useCompanyStore((state) => state.loading);
   const error = useCompanyStore((state) => state.error);
   const connectionStatus = useCompanyStore((state) => state.connectionStatus);
+  const activeFloorId = useCompanyStore((state) => state.activeFloorId);
   const loadBootstrap = useCompanyStore((state) => state.loadBootstrap);
   const connectWebSocket = useCompanyStore((state) => state.connectWebSocket);
   const sendMessage = useCompanyStore((state) => state.sendMessage);
   const openPhone = useCompanyStore((state) => state.openPhone);
   const closePhone = useCompanyStore((state) => state.closePhone);
   const sendAgentMessage = useCompanyStore((state) => state.sendAgentMessage);
+  const sendMeetingMessage = useCompanyStore((state) => state.sendMeetingMessage);
   const startMeeting = useCompanyStore((state) => state.startMeeting);
   const finishMeeting = useCompanyStore((state) => state.finishMeeting);
+  const loadFloor = useCompanyStore((state) => state.loadFloor);
+  const createFloor = useCompanyStore((state) => state.createFloor);
+  const updateFloor = useCompanyStore((state) => state.updateFloor);
+  const deleteFloor = useCompanyStore((state) => state.deleteFloor);
+  const createWorkstation = useCompanyStore((state) => state.createWorkstation);
+  const hireCandidate = useCompanyStore((state) => state.hireCandidate);
+  const terminationPreview = useCompanyStore((state) => state.terminationPreview);
+  const loadTerminationPreview = useCompanyStore((state) => state.loadTerminationPreview);
+  const clearTerminationPreview = useCompanyStore((state) => state.clearTerminationPreview);
+  const terminateEmployee = useCompanyStore((state) => state.terminateEmployee);
   const [activeView, setActiveView] = useState<View>('office');
   const [message, setMessage] = useState('');
+  const [meetingMessageOpen, setMeetingMessageOpen] = useState(false);
+  const [floorModalOpen, setFloorModalOpen] = useState(false);
   const selected = useMemo(() => selectedEmployee(employees, selectedEmployeeId), [employees, selectedEmployeeId]);
   const phoneEmployee = employees.find((employee) => employee.id === phoneEmployeeId) ?? null;
   const activeMeeting = bootstrap?.meetings.find((meeting) => ['WAITING_FOR_PARTICIPANTS', 'IN_PROGRESS'].includes(meeting.status));
+  const activeFloor = bootstrap?.floors.find((floor) => floor.id === activeFloorId) ?? bootstrap?.floors[0];
 
   useEffect(() => {
     let closeSocket: (() => void) | undefined;
@@ -111,7 +132,7 @@ export function App(): ReactElement {
         </div>
         <div className="topbar-center">
           <span className="status-pip online" />
-          <span>{employees.length} 名员工在线</span>
+          <span>{employees.filter((employee) => employee.employmentStatus === 'ACTIVE').length} 名员工在线</span>
           <span className="topbar-divider" />
           <span className="project-chip">PERSISTENT RUNTIME / v0.2</span>
         </div>
@@ -164,7 +185,7 @@ export function App(): ReactElement {
 
         {activeView === 'models' ? (
           <main className="models-column">
-            <ModelProviderPage providers={bootstrap?.modelProfiles ?? []} employees={employees} />
+            <ModelProviderPage providers={bootstrap?.modelProfiles ?? []} employees={employees} openclaw={bootstrap?.openclaw} />
           </main>
         ) : (
           <>
@@ -172,20 +193,22 @@ export function App(): ReactElement {
               <div className="office-toolbar">
                 <div>
                   <span className="eyebrow">LIVE FLOOR</span>
-                  <h1>公司办公室</h1>
+                  <h1>{activeFloor?.name ?? '公司办公室'}</h1>
                 </div>
                 <div className="toolbar-legend">
                   <span><i className="legend-dot green" />工作中</span>
                   <span><i className="legend-dot amber" />Agent 事件</span>
                   <span><i className="legend-dot blue" />会议</span>
                   <span className="zoom-hint">滚轮缩放 · 拖动画布 · 点击人物打开手机</span>
+                  <FloorSwitcher floors={bootstrap?.floors ?? []} activeFloorId={activeFloor?.id} onSelect={(floorId) => void loadFloor(floorId)} onCreate={() => setFloorModalOpen(true)} />
                   <button className="send-button spatial-demo-button" type="button" onClick={() => void startMeeting(['backend-01', 'frontend-01', 'qa-01'])}>召开三人会议</button>
                   {activeMeeting && <button className="ghost-button" type="button" onClick={() => void finishMeeting(activeMeeting.id)}>结束会议并回工位</button>}
                 </div>
               </div>
               <div className="runtime-banner"><span className="runtime-pulse" /> Agent Worker 正在后台运行 · 所有消息、Job、状态和事件均持久化</div>
+              {activeFloor && <FloorMissionCard floor={activeFloor} canDelete={activeFloor.id !== 'floor-01'} onSave={(name, mission) => void updateFloor(activeFloor.id, { name, mission })} onDelete={() => { if (window.confirm(`确定删除楼层“${activeFloor.name}”吗？`)) void deleteFloor(activeFloor.id); }} />}
               <div className="canvas-shell">
-                <OfficeCanvas />
+                <OfficeCanvas onMeetingTableClick={() => setMeetingMessageOpen(true)} />
                 <div className="canvas-caption"><span>●</span> HD-2D OFFICE · BACKEND STATE</div>
               </div>
               <EventTimeline events={events} employees={employees} />
@@ -207,7 +230,8 @@ export function App(): ReactElement {
                   />
                 ))}
               </div>
-              {selected && <EmployeeProfile employee={selected} onOpenPhone={() => void openPhone(selected.id)} />}
+              {bootstrap && <HiringPanel activeFloorId={activeFloor?.id} requests={bootstrap.hiringRequests} workstations={bootstrap.workstations} onHire={hireCandidate} onAddWorkstation={() => activeFloor && void createWorkstation(activeFloor.id)} />}
+              {selected && <EmployeeProfile employee={selected} onOpenPhone={() => void openPhone(selected.id)} onRequestTermination={() => void loadTerminationPreview(selected.id)} />}
             </aside>
           </>
         )}
@@ -222,19 +246,133 @@ export function App(): ReactElement {
           onSend={sendAgentMessage}
         />
       )}
+      {meetingMessageOpen && (
+        <MeetingMessageModal
+          meeting={activeMeeting ?? null}
+          employees={employees}
+          messages={messages}
+          onClose={() => setMeetingMessageOpen(false)}
+          onSend={sendMeetingMessage}
+        />
+      )}
+      {floorModalOpen && <CreateFloorModal onClose={() => setFloorModalOpen(false)} onCreate={async (name, mission) => { await createFloor({ name, mission }); setFloorModalOpen(false); }} />}
+      {terminationPreview && <TerminationModal preview={terminationPreview} onClose={clearTerminationPreview} onConfirm={async (input) => { await terminateEmployee(terminationPreview.employee.id, input); }} />}
       {error && <div className="toast-error">{error}</div>}
     </div>
   );
 }
 
-function ModelProviderPage({ providers, employees }: { providers: ModelProfileSummary[]; employees: Employee[] }): ReactElement {
+function FloorSwitcher({
+  floors,
+  activeFloorId,
+  onSelect,
+  onCreate,
+}: {
+  floors: FloorSummary[];
+  activeFloorId?: string;
+  onSelect: (floorId: string) => void;
+  onCreate: () => void;
+}): ReactElement {
+  return <div className="floor-switcher"><select aria-label="切换楼层" value={activeFloorId ?? ''} onChange={(event) => onSelect(event.target.value)}>{floors.map((floor) => <option value={floor.id} key={floor.id}>F{floor.floorNumber} · {floor.name}</option>)}</select><button className="ghost-button" type="button" onClick={onCreate}>＋ 新建楼层</button></div>;
+}
+
+function FloorMissionCard({ floor, canDelete, onSave, onDelete }: { floor: FloorSummary; canDelete: boolean; onSave: (name: string, mission: string) => void; onDelete: () => void }): ReactElement {
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(floor.name);
+  const [mission, setMission] = useState(floor.mission);
+  useEffect(() => {
+    setName(floor.name);
+    setMission(floor.mission);
+    setEditing(false);
+  }, [floor.id, floor.mission]);
+  return <section className="floor-mission-card"><div><span className="eyebrow">FLOOR MISSION · F{floor.floorNumber}</span>{editing ? <input value={name} onChange={(event) => setName(event.target.value)} aria-label="楼层名称" /> : <strong>{floor.name}</strong>}<p>{floor.mission || '还没有定义职责。可以直接告诉 HR 或在这里补充这一层的使命。'}</p><div className="floor-role-chips">{floor.roles.map((role) => <span key={role.id}>{role.name}</span>)}</div></div><div className="floor-actions"><button className="ghost-button" type="button" onClick={() => { if (editing) onSave(name.trim(), mission.trim()); setEditing(!editing); }}>{editing ? '保存' : '编辑楼层'}</button>{canDelete && <button className="danger-button" type="button" onClick={onDelete}>删除</button>}</div>{editing && <textarea value={mission} onChange={(event) => setMission(event.target.value)} rows={2} placeholder="例如：负责科技类内容的选题、研究、创作与审核。" />}</section>;
+}
+
+function CreateFloorModal({ onClose, onCreate }: { onClose: () => void; onCreate: (name: string, mission?: string) => Promise<void> }): ReactElement {
+  const [name, setName] = useState('');
+  const [mission, setMission] = useState('');
+  const [saving, setSaving] = useState(false);
+  async function submit(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (!name.trim() || saving) return;
+    setSaving(true);
+    try {
+      await onCreate(name.trim(), mission.trim() || undefined);
+    } finally {
+      setSaving(false);
+    }
+  }
+  return <div className="simple-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><form className="simple-modal" onSubmit={submit}><div className="modal-heading"><div><span className="eyebrow">CREATE FLOOR</span><h2>新建楼层</h2></div><button type="button" onClick={onClose} aria-label="关闭">×</button></div><label>楼层名称<input autoFocus required value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：自媒体中心" /></label><label>初始使命 <small>可稍后编辑</small><textarea value={mission} onChange={(event) => setMission(event.target.value)} rows={3} placeholder="例如：负责科技类内容的选题、研究、创作与审核。" /></label><p className="modal-hint">系统自动分配下一个 F 编号，创建空的基础办公空间，并预置 HR、管理员两个可扩展角色。</p><div className="modal-actions"><button className="ghost-button" type="button" onClick={onClose}>取消</button><button className="send-button" type="submit" disabled={saving}>{saving ? '创建中…' : '创建楼层'}</button></div></form></div>;
+}
+
+function HiringPanel({
+  activeFloorId,
+  requests,
+  workstations,
+  onHire,
+  onAddWorkstation,
+}: {
+  activeFloorId?: string;
+  requests: HiringRequestSummary[];
+  workstations: Array<{ id: string; status: string }>;
+  onHire: (requestId: string, candidateId: string, workstationId?: string) => Promise<unknown>;
+  onAddWorkstation: () => void;
+}): ReactElement {
+  const [busyCandidateId, setBusyCandidateId] = useState<string | null>(null);
+  const available = workstations.filter((workstation) => workstation.status === 'AVAILABLE');
+  const activeRequests = requests.filter((request) => request.floorId === activeFloorId && request.candidates.some((candidate) => candidate.status === 'AVAILABLE'));
+  if (activeRequests.length === 0) return <section className="hiring-panel"><div className="section-title">招聘 PIPELINE</div><p className="panel-muted">和 HR 苏晴聊天后，候选人会出现在这里。候选人不会自动入职。</p></section>;
+  async function hire(requestId: string, candidate: CandidateSummary): Promise<void> {
+    if (!available[0] || busyCandidateId) return;
+    setBusyCandidateId(candidate.id);
+    try {
+      await onHire(requestId, candidate.id, available[0].id);
+    } finally {
+      setBusyCandidateId(null);
+    }
+  }
+  return <section className="hiring-panel"><div className="hiring-panel-heading"><div><div className="section-title">招聘 PIPELINE</div><p className="panel-muted">选择候选人后才会创建 Employee，并从公司入口开始入职移动。</p></div>{available.length === 0 && <button className="ghost-button" type="button" onClick={onAddWorkstation}>＋ 新增工位</button>}</div>{activeRequests.slice(0, 3).map((request) => <div className="hiring-request" key={request.id}><div className="hiring-request-title"><strong>{request.summary}</strong><span>{request.status}</span></div>{request.positions.map((position) => <div className="position-group" key={position.id}><div className="position-label">{position.title} · 需要 {position.headcount} 人</div><div className="candidate-list">{request.candidates.filter((candidate) => candidate.positionId === position.id && candidate.status === 'AVAILABLE').map((candidate) => <CandidateCard candidate={candidate} key={candidate.id} disabled={!available[0] || busyCandidateId !== null} onHire={() => void hire(request.id, candidate)} />)}</div></div>)}</div>)}</section>;
+}
+
+function CandidateCard({ candidate, disabled, onHire }: { candidate: CandidateSummary; disabled: boolean; onHire: () => void }): ReactElement {
+  return <article className="candidate-card"><div className="candidate-card-heading"><div className="candidate-avatar" style={{ background: candidate.appearance.topColor }}>{candidate.name.slice(0, 1)}</div><div><strong>{candidate.name}</strong><span>{candidate.title} · {candidate.age} 岁</span></div><b>{candidate.matchScore}%</b></div><div className="candidate-chips">{candidate.personality.traits.slice(0, 3).map((trait) => <span key={trait}>{trait}</span>)}</div><p>{candidate.strengths.slice(0, 2).join('、')}</p><small>技能：{candidate.skills.slice(0, 3).map((skill) => `${skill.name} ${skill.level}`).join(' · ')}</small><button className="send-button" type="button" disabled={disabled} onClick={onHire}>{disabled ? '需要工位' : '录用并开始入职'}</button></article>;
+}
+
+function TerminationModal({ preview, onClose, onConfirm }: { preview: TerminationPreview; onClose: () => void; onConfirm: (input: TerminationInput) => Promise<void> }): ReactElement {
+  const [taskAction, setTaskAction] = useState<TerminationInput['taskAction']>('REASSIGN');
+  const [workspaceAction, setWorkspaceAction] = useState<TerminationInput['workspaceAction']>('ARCHIVE');
+  const [reason, setReason] = useState('岗位或组织调整');
+  const [notes, setNotes] = useState('保留历史记录，完成任务交接。');
+  const [confirming, setConfirming] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  async function submit(): Promise<void> {
+    if (!confirming) {
+      setConfirming(true);
+      return;
+    }
+    setSaving(true);
+    try {
+      await onConfirm({ reason, notes, taskAction, workspaceAction });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <div className="termination-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="termination-modal" role="dialog" aria-modal="true" aria-label="员工离职预览"><div className="termination-heading"><div><span className="eyebrow">OFFBOARDING PREVIEW</span><h2>解雇 {preview.employee.name}</h2></div><button type="button" onClick={onClose} aria-label="关闭">×</button></div><p className="termination-warning">这不会删除员工。聊天、会议、Job、任务和工作记录会继续保留；员工会先完成交接、停止 Runtime，再沿办公室路线离开。</p><div className="termination-metrics"><span>未完成任务<strong>{preview.activeTaskCount}</strong></span><span>运行中 Job<strong>{preview.runningJobCount}</strong></span><span>关联 Goal<strong>{preview.activeGoalCount}</strong></span><span>进行中会议<strong>{preview.activeMeetingCount}</strong></span><span>Workspace<strong>{preview.workspaceStatus}</strong></span><span>Runtime<strong>{preview.runtimeType} / {preview.runtimeStatus}</strong></span></div>{preview.tasks.length > 0 && <div className="termination-task-list"><div className="section-title">任务交接对象</div>{preview.tasks.slice(0, 6).map((task) => <div key={task.id}><span>{task.title}</span><small>{task.status}</small></div>)}</div>}<div className="termination-form"><label>任务处理<select value={taskAction} onChange={(event) => setTaskAction(event.target.value as TerminationInput['taskAction'])}><option value="REASSIGN">标记为待重新分配</option><option value="PAUSE">先暂停</option><option value="CANCEL">取消任务</option></select></label><label>Workspace<select value={workspaceAction} onChange={(event) => setWorkspaceAction(event.target.value as TerminationInput['workspaceAction'])}><option value="ARCHIVE">归档保留</option><option value="READ_ONLY">保留为只读</option></select></label><label>原因<input value={reason} onChange={(event) => setReason(event.target.value)} /></label><label>备注<textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={2} /></label></div><div className="termination-actions"><button className="ghost-button" type="button" onClick={onClose}>取消</button><button className="danger-button" type="button" onClick={() => void submit()} disabled={saving}>{saving ? '处理中…' : confirming ? '再次确认并开始离职' : '查看影响后继续'}</button></div></section></div>;
+}
+
+function ModelProviderPage({ providers, employees, openclaw }: { providers: ModelProfileSummary[]; employees: Employee[]; openclaw?: OpenClawStatus }): ReactElement {
   const saveProvider = useCompanyStore((state) => state.saveProvider);
   const testProvider = useCompanyStore((state) => state.testProvider);
   const bindEmployeeModel = useCompanyStore((state) => state.bindEmployeeModel);
+  const testOpenClaw = useCompanyStore((state) => state.testOpenClaw);
+  const provisionEmployeeRuntime = useCompanyStore((state) => state.provisionEmployeeRuntime);
   const [editingId, setEditingId] = useState<string | undefined>();
   const [form, setForm] = useState<ModelProfileInput>(emptyProvider());
   const [status, setStatus] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [openclawBusy, setOpenclawBusy] = useState(false);
 
   function startEdit(provider: ModelProfileSummary): void {
     setEditingId(provider.id);
@@ -279,12 +417,40 @@ function ModelProviderPage({ providers, employees }: { providers: ModelProfileSu
     }
   }
 
+  async function checkOpenClaw(): Promise<void> {
+    setOpenclawBusy(true);
+    try {
+      const result = await testOpenClaw();
+      setStatus(result.reachable ? 'OpenClaw Gateway 连接成功。' : result.lastError ?? 'OpenClaw Gateway 暂不可达。');
+    } catch {
+      setStatus('OpenClaw Gateway 检查失败。');
+    } finally {
+      setOpenclawBusy(false);
+    }
+  }
+
+  async function provision(employee: Employee): Promise<void> {
+    setOpenclawBusy(true);
+    try {
+      await provisionEmployeeRuntime(employee.id);
+      setStatus(`${employee.name} 已绑定 OpenClaw Agent；后续消息由该 Agent Runtime 处理。`);
+    } catch {
+      setStatus('Provision 失败：请先安装 OpenClaw、启动 Gateway，并检查后端环境变量。');
+    } finally {
+      setOpenclawBusy(false);
+    }
+  }
+
   return (
     <section className="models-page">
       <div className="models-heading">
         <div><span className="eyebrow">MODEL CONTROL PLANE</span><h1>大模型</h1><p>配置多个 Provider，Agent 通过 model profile 绑定模型；完整 API Key 永远不会返回到浏览器。</p></div>
         <button className="send-button models-add" type="button" onClick={startCreate}>＋ 新增 Provider</button>
       </div>
+      <section className="runtime-control-card">
+        <div><span className="eyebrow">OPTIONAL AGENT RUNTIME</span><h2>OpenClaw Gateway</h2><p>{openclaw?.enabled ? `地址：${openclaw.gatewayUrl}` : '当前未启用；系统继续使用内置 Mock / Provider Runtime。'}</p>{openclaw?.lastError && <small>{openclaw.lastError}</small>}</div>
+        <div className="runtime-control-actions"><span className={`enabled-pill ${openclaw?.reachable ? 'on' : ''}`}>{openclaw?.reachable ? 'Gateway 在线' : openclaw?.enabled ? '未连接' : '未启用'}</span><button className="ghost-button" type="button" onClick={() => void checkOpenClaw()} disabled={openclawBusy}>测试 Gateway</button></div>
+      </section>
       <div className="models-grid">
         <div className="provider-list">
           <div className="section-title">已配置 PROVIDERS</div>
@@ -309,7 +475,7 @@ function ModelProviderPage({ providers, employees }: { providers: ModelProfileSu
           <button className="send-button" type="submit" disabled={saving}>{saving ? '保存中…' : '保存 Provider'}</button>
           {status && <div className="provider-status">{status}</div>}
           <p className="security-note">API Key 使用 `MODEL_PROFILE_ENCRYPTION_KEY` 派生的 AES-256-GCM 加密保存。请在运行 Rust 后端的 WSL 环境设置该变量。</p>
-          <div className="binding-section"><div className="section-title">AGENT 模型绑定</div><p className="binding-note">Agent 只保存 model_profile_id，不保存 Base URL 或 API Key。</p>{employees.map((employee) => <label className="binding-row" key={employee.id}><span>{employee.name}<small>{employee.title}</small></span><select value={employee.modelProfileId ?? ''} onChange={(event) => void bindEmployeeModel(employee.id, event.target.value || null)}><option value="">未绑定</option>{providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name} · {provider.model}</option>)}</select></label>)}</div>
+          <div className="binding-section"><div className="section-title">AGENT 模型绑定</div><p className="binding-note">Agent 只保存 model_profile_id，不保存 Base URL 或 API Key。</p>{employees.map((employee) => <div className="binding-row" key={employee.id}><label><span>{employee.name}<small>{employee.title}</small></span><select value={employee.modelProfileId ?? ''} onChange={(event) => void bindEmployeeModel(employee.id, event.target.value || null)}><option value="">未绑定</option>{providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name} · {provider.model}</option>)}</select></label><div className="runtime-binding"><small>{employee.runtimeBinding?.runtimeType ?? 'MOCK'} · {employee.runtimeBinding?.provisionStatus ?? 'READY'}</small>{employee.employmentStatus === 'ACTIVE' && employee.runtimeBinding?.runtimeType !== 'OPENCLAW' && <button className="ghost-button" type="button" onClick={() => void provision(employee)} disabled={openclawBusy}>绑定 OpenClaw</button>}</div></div>)}</div>
         </form>
       </div>
     </section>
@@ -378,7 +544,7 @@ function PhoneModal({
   async function submit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     const content = draft.trim();
-    if (!content || sending) return;
+    if (!content || sending || employee.employmentStatus !== 'ACTIVE') return;
     setSending(true);
     try {
       await onSend(employee.id, content);
@@ -402,12 +568,100 @@ function PhoneModal({
             {messageHistory?.hasMore && <button className="load-older-messages" type="button" onClick={() => void loadOlder()} disabled={messageHistory.loading}>{messageHistory.loading ? '加载中…' : '加载更早消息'}</button>}
             {conversation.length === 0 && <div className="phone-empty">还没有对话，发一条消息开始工作。</div>}
             {conversation.map((message) => <div className={`chat-bubble ${message.fromType === 'user' ? 'outgoing' : 'incoming'}`} key={message.id}><span>{message.content}</span><time>{formatTime(message.createdAt)}</time></div>)}
-          </div><form className="phone-compose" onSubmit={submit}><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={`发送给 ${employee.name}…`} /><button type="submit" disabled={sending}>{sending ? '…' : '↑'}</button></form></div>}
+          </div><form className="phone-compose" onSubmit={submit}><input value={draft} disabled={employee.employmentStatus !== 'ACTIVE'} onChange={(event) => setDraft(event.target.value)} placeholder={employee.employmentStatus === 'ACTIVE' ? `发送给 ${employee.name}…` : '该员工已离职，仅保留历史消息'} /><button type="submit" disabled={sending || employee.employmentStatus !== 'ACTIVE'}>{sending ? '…' : '↑'}</button></form></div>}
           {tab === 'profile' && <ProfileTab employee={employee} />}
           {tab === 'work' && <WorkTab employee={employee} goalTitle={goal?.title} task={task?.title} jobs={jobs} />}
           {tab === 'memory' && <MemoryTab memories={memories} />}
         </div>
         <div className="phone-home-indicator" />
+      </section>
+    </div>
+  );
+}
+
+function MeetingMessageModal({
+  meeting,
+  employees,
+  messages,
+  onClose,
+  onSend,
+}: {
+  meeting: MeetingSummary | null;
+  employees: Employee[];
+  messages: MessageRecord[];
+  onClose: () => void;
+  onSend: (meetingId: string, content: string) => Promise<void>;
+}): ReactElement {
+  const [draft, setDraft] = useState('');
+  const [sending, setSending] = useState(false);
+  const listRef = useRef<HTMLDivElement>(null);
+  const employeeById = useMemo(() => new Map(employees.map((employee) => [employee.id, employee])), [employees]);
+  const conversation = useMemo(() => {
+    if (!meeting) return [];
+    const seenBroadcasts = new Set<string>();
+    return messages
+      .filter((message) => message.meetingId === meeting.id)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .filter((message) => {
+        if (message.fromType !== 'user' || !message.broadcastId) return true;
+        if (seenBroadcasts.has(message.broadcastId)) return false;
+        seenBroadcasts.add(message.broadcastId);
+        return true;
+      });
+  }, [meeting, messages]);
+
+  useLayoutEffect(() => {
+    const list = listRef.current;
+    if (list) list.scrollTop = list.scrollHeight;
+  }, [conversation.length]);
+
+  async function submit(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const content = draft.trim();
+    if (!meeting || !content || sending) return;
+    setSending(true);
+    try {
+      await onSend(meeting.id, content);
+      setDraft('');
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return (
+    <div className="meeting-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="meeting-message-shell" role="dialog" aria-modal="true" aria-label="会议桌消息">
+        <div className="meeting-message-header">
+          <div><span className="eyebrow">MEETING TABLE / BROADCAST</span><h2>会议桌消息</h2></div>
+          <button type="button" onClick={onClose} aria-label="关闭">×</button>
+        </div>
+        {!meeting ? (
+          <div className="meeting-empty">当前没有进行中的会议。先召开会议，等 Agent 到达会议桌后即可向全体在席成员发送消息。</div>
+        ) : (
+          <>
+            <div className="meeting-context-card">
+              <strong>{meeting.title}</strong>
+              <span>{meeting.status === 'IN_PROGRESS' ? '会议进行中' : '等待会议开始'} · 只有已经坐到会议桌的 Agent 会收到广播</span>
+              <div className="meeting-participant-list">
+                {meeting.participants.map((participant) => {
+                  const employee = employeeById.get(participant.agentId);
+                  return <span key={participant.agentId} className={`meeting-participant ${participant.status}`}><i />{employee?.name ?? participant.agentId}<small>{participant.status}</small></span>;
+                })}
+              </div>
+            </div>
+            <div className="meeting-message-list" ref={listRef}>
+              {conversation.length === 0 && <div className="meeting-empty">还没有会议消息。可以直接向在席 Agent 描述目标、需求或决策。</div>}
+              {conversation.map((message) => {
+                const employee = message.fromType === 'employee' ? employeeById.get(message.fromId) : undefined;
+                return <div className={`meeting-bubble ${message.fromType === 'user' ? 'outgoing' : 'incoming'}`} key={message.id}><strong>{message.fromType === 'user' ? 'CEO → 全体在席 Agent' : employee?.name ?? message.fromId}</strong><span>{message.content}</span><time>{formatTime(message.createdAt)}</time></div>;
+              })}
+            </div>
+            <form className="meeting-compose" onSubmit={submit}>
+              <input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="向会议桌上的所有 Agent 发送消息…" />
+              <button type="submit" disabled={sending}>{sending ? '…' : '发送广播'}</button>
+            </form>
+          </>
+        )}
       </section>
     </div>
   );
@@ -429,16 +683,16 @@ function MemoryTab({ memories }: { memories: Array<{ id: string; kind: string; c
 
 function EmployeeListItem({ employee, selected, onClick }: { employee: Employee; selected: boolean; onClick: () => void }): ReactElement {
   const usage = employee.tokenUsage ?? EMPTY_TOKEN_USAGE;
-  return <button className={`employee-item ${selected ? 'selected' : ''}`} type="button" onClick={onClick}><span className="employee-avatar" style={{ background: employee.appearance.topColor, color: employee.appearance.skinTone }}>{employee.name.slice(0, 1)}</span><span className="employee-item-copy"><strong>{employee.name}</strong><small>{employee.title}</small><span className="employee-token-breakdown">IN {formatTokens(usage.inputTokens)} · OUT {formatTokens(usage.outputTokens)} · CACHE {formatTokens(usage.cacheTokens)}</span></span><span className="employee-token-total" title={`累计 ${usage.totalTokens.toLocaleString('zh-CN')} tokens`}>{formatTokens(usage.totalTokens)}</span>{employee.unreadCount > 0 && <span className="employee-unread">{employee.unreadCount}</span>}<span className={`state-dot ${employee.currentState}`} /></button>;
+  return <button className={`employee-item ${selected ? 'selected' : ''} ${employee.employmentStatus === 'TERMINATED' ? 'former-employee' : ''}`} type="button" onClick={onClick}><span className="employee-avatar" style={{ background: employee.appearance.topColor, color: employee.appearance.skinTone }}>{employee.name.slice(0, 1)}</span><span className="employee-item-copy"><strong>{employee.name}{employee.employmentStatus === 'TERMINATED' && <em>已离职</em>}</strong><small>{employee.title}</small><span className="employee-token-breakdown">IN {formatTokens(usage.inputTokens)} · OUT {formatTokens(usage.outputTokens)} · CACHE {formatTokens(usage.cacheTokens)}</span></span><span className="employee-token-total" title={`累计 ${usage.totalTokens.toLocaleString('zh-CN')} tokens`}>{formatTokens(usage.totalTokens)}</span>{employee.unreadCount > 0 && <span className="employee-unread">{employee.unreadCount}</span>}<span className={`state-dot ${employee.currentState}`} /></button>;
 }
 
 function TokenUsageOverview({ usage }: { usage: TokenUsageSummary }): ReactElement {
   return <section className="token-overview"><div><span>累计 Token</span><strong title={usage.totalTokens.toLocaleString('zh-CN')}>{formatTokens(usage.totalTokens)}</strong></div><div className="token-overview-breakdown"><span>IN <b>{formatTokens(usage.inputTokens)}</b></span><span>OUT <b>{formatTokens(usage.outputTokens)}</b></span><span>CACHE <b>{formatTokens(usage.cacheTokens)}</b></span></div></section>;
 }
 
-function EmployeeProfile({ employee, onOpenPhone }: { employee: Employee; onOpenPhone: () => void }): ReactElement {
+function EmployeeProfile({ employee, onOpenPhone, onRequestTermination }: { employee: Employee; onOpenPhone: () => void; onRequestTermination: () => void }): ReactElement {
   const focusEmployee = (): void => { window.dispatchEvent(new CustomEvent('office:focus', { detail: employee.id })); };
-  return <div className="profile-card"><div className="profile-banner" style={{ background: `linear-gradient(135deg, ${employee.appearance.topColor}, #1e2b3a)` }}><span className="profile-avatar" style={{ background: employee.appearance.skinTone, color: employee.appearance.hairColor }}>{employee.name.slice(0, 1)}</span><div><h3>{employee.name}</h3><span>{employee.title}</span></div><span className={`profile-state ${employee.currentState}`}>{STATE_LABELS[employee.currentState]}</span></div><div className="profile-body"><div className="profile-facts"><span>{employee.age} 岁 · {genderLabel(employee.gender)}</span><span>{employee.department}</span></div><div className="profile-section"><div className="section-title">性格特征</div><div className="trait-row">{employee.personality.traits.map((trait) => <span className="trait-chip" key={trait}>{trait}</span>)}</div><p className="profile-quote">“{employee.personality.communicationStyle}”</p></div><div className="profile-section"><div className="section-title">技能档案</div>{employee.skills.slice(0, 4).map((skill) => <div className="skill-row" key={skill.name}><div><span>{skill.name}</span><small>{skill.level}</small></div><div className="skill-track"><span style={{ width: `${skill.level}%` }} /></div></div>)}</div><div className="profile-section current-work"><div className="section-title">当前工作</div><div className="work-status"><span className={`state-dot ${employee.currentState}`} /><strong>{STATE_LABELS[employee.currentState]}</strong><span>· {employee.modelProfile?.model ?? employee.modelConfig.model}</span></div></div><div className="profile-actions"><button className="locate-button" type="button" onClick={focusEmployee}>⌖ 定位</button><button className="phone-button" type="button" onClick={onOpenPhone}>▣ 打开手机</button></div></div></div>;
+  return <div className="profile-card"><div className="profile-banner" style={{ background: `linear-gradient(135deg, ${employee.appearance.topColor}, #1e2b3a)` }}><span className="profile-avatar" style={{ background: employee.appearance.skinTone, color: employee.appearance.hairColor }}>{employee.name.slice(0, 1)}</span><div><h3>{employee.name}</h3><span>{employee.title}</span></div><span className={`profile-state ${employee.currentState}`}>{employee.employmentStatus === 'TERMINATED' ? '已离职' : STATE_LABELS[employee.currentState]}</span></div><div className="profile-body"><div className="profile-facts"><span>{employee.age} 岁 · {genderLabel(employee.gender)}</span><span>{employee.department}</span></div><div className="profile-section"><div className="section-title">性格特征</div><div className="trait-row">{employee.personality.traits.map((trait) => <span className="trait-chip" key={trait}>{trait}</span>)}</div><p className="profile-quote">“{employee.personality.communicationStyle}”</p></div><div className="profile-section"><div className="section-title">技能档案</div>{employee.skills.slice(0, 4).map((skill) => <div className="skill-row" key={skill.name}><div><span>{skill.name}</span><small>{skill.level}</small></div><div className="skill-track"><span style={{ width: `${skill.level}%` }} /></div></div>)}</div><div className="profile-section current-work"><div className="section-title">当前工作</div><div className="work-status"><span className={`state-dot ${employee.currentState}`} /><strong>{employee.employmentStatus === 'TERMINATED' ? '历史员工' : STATE_LABELS[employee.currentState]}</strong><span>· {employee.modelProfile?.model ?? employee.modelConfig.model}</span></div></div><div className="profile-actions"><button className="locate-button" type="button" onClick={focusEmployee}>⌖ 定位</button><button className="phone-button" type="button" onClick={onOpenPhone}>▣ 查看手机</button>{employee.employmentStatus === 'ACTIVE' && <button className="danger-button" type="button" onClick={onRequestTermination}>解雇</button>}</div></div></div>;
 }
 
 function EventTimeline({ events, employees }: { events: DomainEvent[]; employees: Employee[] }): ReactElement {

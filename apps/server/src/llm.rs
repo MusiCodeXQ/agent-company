@@ -32,11 +32,16 @@ pub async fn chat(
             .find(|message| message.role == "user")
             .map(|message| message.content.as_str())
             .unwrap_or("这条消息");
-        return Ok(ChatResponse {
-            content: format!(
+        let content = if system_prompt.contains("会议桌旁") {
+            mock_meeting_reply(system_prompt, latest)
+        } else {
+            format!(
                 "我已收到你的消息：{}。当前运行在 Mock Provider；切换到 OpenAI Compatible Provider 后，我会继续沿用同一条持久化工作流。",
                 latest
-            ),
+            )
+        };
+        return Ok(ChatResponse {
+            content,
             usage: TokenUsageSummary::default(),
         });
     }
@@ -159,6 +164,68 @@ fn is_openai_compatible(protocol: &str) -> bool {
     protocol.eq_ignore_ascii_case("openai_compatible")
         || protocol.eq_ignore_ascii_case("openai-compatible")
         || protocol.eq_ignore_ascii_case("openai")
+}
+
+fn mock_meeting_reply(system_prompt: &str, latest: &str) -> String {
+    let normalized = latest.trim();
+    if normalized.len() < 6
+        || ["大家好", "收到", "谢谢", "好的", "明白了", "辛苦了"].contains(&normalized)
+    {
+        return "NO_REPLY".to_string();
+    }
+    let title = system_prompt
+        .split("职位：")
+        .nth(1)
+        .and_then(|value| value.split('；').next())
+        .unwrap_or("当前职能");
+    let role_question = if contains_any(
+        title,
+        &["后端", "服务端", "架构", "技术", "Backend", "Architect"],
+    ) {
+        "从技术方案角度，我需要确认：这项工作的核心约束是什么（性能、数据、合规、成本或系统集成）？最终验收指标由谁确认？"
+    } else if contains_any(
+        title,
+        &["前端", "客户端", "UI", "UX", "设计", "Frontend", "Designer"],
+    ) {
+        "从用户体验和交付范围角度，我需要确认：目标用户是谁，优先覆盖哪些平台或场景？哪些体验指标代表这项工作完成？"
+    } else if contains_any(title, &["测试", "质量", "QA", "Test"]) {
+        "从质量保障角度，我需要确认：成功标准和不可接受的问题分别是什么？需要覆盖哪些边界场景，谁负责最终验收？"
+    } else if contains_any(title, &["产品", "Product"]) {
+        "从产品角度，我需要确认：这次工作的目标用户、优先级和成功指标是什么？如果范围冲突，哪个结果优先？"
+    } else if contains_any(title, &["HR", "人事", "招聘", "人才"]) {
+        "从人员和组织角度，我需要确认：需要哪些角色参与、由谁负责决策？时间范围和人员预算边界是什么？"
+    } else if contains_any(title, &["财务", "Finance", "会计", "采购"]) {
+        "从预算与执行角度，我需要确认：预算上限、审批人和成本口径是什么？哪些支出可以先行，哪些必须事前审批？"
+    } else if contains_any(title, &["法务", "合规", "Legal", "Compliance"]) {
+        "从风险与合规角度，我需要确认：涉及哪些地区、数据或监管要求？需要保留哪些审计记录和审批证据？"
+    } else if contains_any(
+        title,
+        &[
+            "销售",
+            "市场",
+            "运营",
+            "客服",
+            "Sales",
+            "Marketing",
+            "Operations",
+        ],
+    ) {
+        "从业务落地角度，我需要确认：服务对象和成功指标是什么？上线或执行后由谁承接反馈、响应和后续迭代？"
+    } else if contains_any(title, &["数据", "算法", "Data", "AI", "研究", "Research"]) {
+        "从数据与评估角度，我需要确认：数据来源、隐私边界和评估指标是什么？结果需要达到什么置信度才算可用？"
+    } else if contains_any(title, &["安全", "Security"]) {
+        "从安全角度，我需要确认：需要防护的资产和威胁边界是什么？是否有必须满足的权限、审计或应急响应要求？"
+    } else {
+        "从我的职能角度，我需要确认：这项工作的目标、优先级和完成标准是什么？有哪些不能突破的时间、预算或风险边界？"
+    };
+    format!(
+        "我对“{}”有一个需要确认的细节：{}",
+        normalized, role_question
+    )
+}
+
+fn contains_any(value: &str, candidates: &[&str]) -> bool {
+    candidates.iter().any(|candidate| value.contains(candidate))
 }
 
 fn truncate(value: &str) -> String {

@@ -11,6 +11,9 @@ import { depthFor, projectFootprint, projectedOfficeSize, projectPoint } from '.
 
 interface DeskView {
   screen: Graphics;
+  screenLabel: Text;
+  badgeName: Text;
+  badgeTitle: Text;
   employeeId: string;
   anchorX: number;
   anchorY: number;
@@ -73,15 +76,21 @@ export class OfficeEngine {
   private lastPointer = { x: 0, y: 0 };
   private cameraTarget: CameraPoint | null = null;
   private readonly onSelect: (employeeId: string) => void;
+  private readonly onMeetingTableClick: () => void;
   private readonly onWheel: (event: WheelEvent) => void;
   private readonly onPointerDown: (event: PointerEvent) => void;
   private readonly onPointerMove: (event: PointerEvent) => void;
   private readonly onPointerUp: () => void;
   private readonly onFocus: (event: Event) => void;
 
-  constructor(app: Application, onSelect: (employeeId: string) => void) {
+  constructor(
+    app: Application,
+    onSelect: (employeeId: string) => void,
+    onMeetingTableClick: () => void = () => undefined,
+  ) {
     this.app = app;
     this.onSelect = onSelect;
+    this.onMeetingTableClick = onMeetingTableClick;
     this.depthLayer.sortableChildren = true;
     this.world.addChild(
       this.floorLayer,
@@ -118,15 +127,18 @@ export class OfficeEngine {
 
   setEmployees(employees: Employee[]): void {
     if (!this.office) return;
-    this.employees = employees;
-    const incomingIds = new Set(employees.map((employee) => employee.id));
+    const visibleEmployees = this.office.floorId
+      ? employees.filter((employee) => employee.floorId === this.office?.floorId && employee.employmentStatus !== 'TERMINATED')
+      : employees.filter((employee) => employee.employmentStatus !== 'TERMINATED');
+    this.employees = visibleEmployees;
+    const incomingIds = new Set(visibleEmployees.map((employee) => employee.id));
     for (const [employeeId, actor] of this.actors) {
       if (!incomingIds.has(employeeId)) {
         actor.destroy({ children: true });
         this.actors.delete(employeeId);
       }
     }
-    for (const employee of employees) {
+    for (const employee of visibleEmployees) {
       const existing = this.actors.get(employee.id);
       if (existing) {
         existing.syncEmployee(
@@ -393,7 +405,18 @@ export class OfficeEngine {
 
     const monitorAnchor = projectPoint({ x: desk.monitorX + 22, y: desk.monitorY + 22 });
     const monitor = new Graphics();
-    drawMonitor(monitor, monitorAnchor.x, monitorAnchor.y, false, 0x5ce1b8);
+    drawMonitor(monitor, monitorAnchor.x, monitorAnchor.y, 'idle', 0x5ce1b8);
+    const screenLabel = new Text({
+      text: 'NEWS',
+      style: {
+        fill: 0xd7fbf4,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontSize: 6.5,
+        fontWeight: '800',
+        letterSpacing: 0.5,
+      },
+    });
+    screenLabel.position.set(monitorAnchor.x - 16, monitorAnchor.y - 32);
     const deskLamp = new Graphics()
       .circle(monitorAnchor.x + 48, monitorAnchor.y - 6, 12)
       .fill({ color: 0xffce74, alpha: 0.04 })
@@ -402,12 +425,53 @@ export class OfficeEngine {
       .stroke({ color: 0x8b765a, width: 2 })
       .circle(monitorAnchor.x + 53, monitorAnchor.y - 24, 4)
       .fill(0xd6a85e);
-    view.addChild(table, keyboard, keyboardLines, deskLamp, monitor);
+
+    const badge = new Container();
+    const badgeSurface = new Graphics()
+      .roundRect(0, 0, 88, 28, 4)
+      .fill({ color: 0xf1d58d, alpha: 0.96 })
+      .stroke({ color: 0x6d522a, width: 1, alpha: 0.95 })
+      .roundRect(3, 3, 82, 22, 2)
+      .fill({ color: 0x18252b, alpha: 0.94 })
+      .stroke({ color: 0xf0ca70, width: 0.7, alpha: 0.72 })
+      .circle(8, 8, 2)
+      .fill(0x77dfc7)
+      .rect(7, 19, 16, 1)
+      .fill({ color: 0xf0ca70, alpha: 0.5 });
+    const badgeName = new Text({
+      text: '未分配',
+      style: {
+        fill: 0xfff1c6,
+        fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+        fontSize: 9,
+        fontWeight: '800',
+      },
+    });
+    badgeName.position.set(14, 4);
+    const badgeTitle = new Text({
+      text: 'WORKSTATION',
+      style: {
+        fill: 0x9fc6c5,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontSize: 6.5,
+        fontWeight: '700',
+        letterSpacing: 0.15,
+      },
+    });
+    badgeTitle.position.set(14, 15);
+    badge.addChild(badgeSurface, badgeName, badgeTitle);
+    const badgeAnchor = projectPoint({ x: desk.x + 12, y: desk.y + 50 });
+    badge.position.set(badgeAnchor.x, badgeAnchor.y - 12);
+
+    view.addChild(table, keyboard, keyboardLines, deskLamp, monitor, screenLabel, badge);
     // Use the furniture's real front edge for depth. Sorting by the seat made
     // the whole workstation render over its owner even when the owner was in front.
     this.addStaticDepthItem(view, desk.y + desk.height, 8);
     this.deskViews.set(desk.id, {
       screen: monitor,
+      screenLabel,
+      badgeName,
+      badgeTitle,
       employeeId: desk.employeeId,
       anchorX: monitorAnchor.x,
       anchorY: monitorAnchor.y,
@@ -480,6 +544,11 @@ export class OfficeEngine {
         .fill({ color: meeting ? 0x83b5b2 : 0xb589a3, alpha: 0.18 });
       item.addChild(graphic, runner);
       depthOffset = 4;
+      if (meeting) {
+        item.eventMode = 'static';
+        item.cursor = 'pointer';
+        item.on('pointertap', () => this.onMeetingTableClick());
+      }
     } else if (furniture.kind === 'reception-counter' || furniture.kind === 'pantry-counter') {
       drawPrism(graphic, furniture.x, furniture.y, furniture.width, furniture.height, 24, {
         top: 0x785b40,
@@ -632,7 +701,7 @@ export class OfficeEngine {
     const employeeById = new Map(this.employees.map((employee) => [employee.id, employee]));
     for (const view of this.deskViews.values()) {
       const employee = employeeById.get(view.employeeId);
-      const active = employee
+      const working = employee
         ? employee.activity === 'CODING' || employee.activity === 'TESTING' || employee.device === 'COMPUTER'
         : false;
       const color = employee?.activity === 'TESTING'
@@ -640,7 +709,13 @@ export class OfficeEngine {
         : employee?.activity === 'THINKING'
           ? 0xcab0ff
           : 0x72e1b6;
-      drawMonitor(view.screen, view.anchorX, view.anchorY, active, color);
+      drawMonitor(view.screen, view.anchorX, view.anchorY, working ? 'work' : 'idle', color);
+      view.screenLabel.text = working
+        ? employee?.activity === 'TESTING' ? 'TEST' : 'CODE'
+        : 'NEWS';
+      view.screenLabel.style.fill = working ? color : 0xd7fbf4;
+      view.badgeName.text = employee?.name ?? '未分配';
+      view.badgeTitle.text = employee?.title || employee?.role || 'WORKSTATION';
     }
   }
 
@@ -763,28 +838,28 @@ function drawMonitor(
   graphics: Graphics,
   x: number,
   y: number,
-  active: boolean,
+  mode: 'idle' | 'work',
   activeColor: number,
 ): void {
+  const working = mode === 'work';
+  const screenColor = working ? activeColor : 0x69d6d3;
   graphics.clear();
-  if (active) {
-    graphics
-      .roundRect(x - 28, y - 42, 56, 36, 7)
-      .fill({ color: activeColor, alpha: 0.08 })
-      .ellipse(x, y - 15, 38, 23)
-      .fill({ color: activeColor, alpha: 0.035 });
-  }
+  graphics
+    .roundRect(x - 30, y - 44, 60, 40, 7)
+    .fill({ color: screenColor, alpha: working ? 0.1 : 0.075 })
+    .ellipse(x, y - 15, 39, 24)
+    .fill({ color: screenColor, alpha: working ? 0.045 : 0.035 });
   graphics
     .roundRect(x - 23, y - 39, 46, 31, 4)
     .fill(0x172129)
-    .stroke({ color: active ? activeColor : 0x70858d, width: active ? 1.5 : 1 })
+    .stroke({ color: screenColor, width: working ? 1.5 : 1.2, alpha: 0.95 })
     .roundRect(x - 19, y - 35, 38, 23, 2)
-    .fill(active ? shadeColor(activeColor, -80) : 0x26343a)
+    .fill(working ? shadeColor(activeColor, -80) : 0x23404a)
     .rect(x - 3, y - 8, 6, 9)
     .fill(0x4d5551)
     .roundRect(x - 13, y, 26, 3, 1.5)
     .fill(0x5d625a);
-  if (active) {
+  if (working) {
     graphics
       .rect(x - 15, y - 31, 16, 2)
       .fill(0xe8fff7)
@@ -796,6 +871,25 @@ function drawMonitor(
       .fill({ color: 0xe8fff7, alpha: 0.52 })
       .circle(x + 16, y - 32, 1.4)
       .fill(activeColor);
+  } else {
+    // Static leisure screen: a news/video thumbnail, play button and progress bar.
+    // It is deliberately drawn once per state update; there is no frame animation.
+    graphics
+      .roundRect(x - 16, y - 31, 26, 13, 2)
+      .fill({ color: 0x4c7480, alpha: 0.94 })
+      .stroke({ color: 0x9ce8df, width: 0.6, alpha: 0.7 })
+      .poly([x - 5, y - 28, x - 5, y - 21, x + 2, y - 24.5])
+      .fill(0xe6fff5)
+      .rect(x - 14, y - 15, 27, 1.5)
+      .fill({ color: 0xb9f7e9, alpha: 0.82 })
+      .rect(x - 14, y - 15, 10, 1.5)
+      .fill(0xf4d27a)
+      .circle(x + 15, y - 30, 1.3)
+      .fill(0xff8076)
+      .rect(x - 14, y - 19, 17, 1.5)
+      .fill({ color: 0xe6fff5, alpha: 0.55 })
+      .rect(x + 6, y - 19, 8, 1.5)
+      .fill({ color: 0xe6fff5, alpha: 0.35 });
   }
 }
 

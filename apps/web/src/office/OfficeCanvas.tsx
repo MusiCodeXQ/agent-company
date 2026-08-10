@@ -5,7 +5,7 @@ import { defaultOffice } from './layout/default-office';
 import { OfficeEngine } from './engine/office-engine';
 import { useCompanyStore } from '../store/company-store';
 
-export function OfficeCanvas(): ReactElement {
+export function OfficeCanvas({ onMeetingTableClick }: { onMeetingTableClick?: () => void }): ReactElement {
   const containerRef = useRef<HTMLDivElement>(null);
   const engineRef = useRef<OfficeEngine | null>(null);
 
@@ -36,9 +36,13 @@ export function OfficeCanvas(): ReactElement {
         }
 
         container.appendChild(app.canvas);
-        engine = new OfficeEngine(app, (employeeId) => {
-          void useCompanyStore.getState().openPhone(employeeId);
-        });
+        engine = new OfficeEngine(
+          app,
+          (employeeId) => {
+            void useCompanyStore.getState().openPhone(employeeId);
+          },
+          () => onMeetingTableClick?.(),
+        );
         engineRef.current = engine;
 
         const resize = (): void => {

@@ -109,6 +109,33 @@ export interface ModelProfileSummary {
   enabled: boolean;
 }
 
+export interface RuntimeBindingSummary {
+  id: string;
+  employeeId: string;
+  runtimeType: string;
+  runtimeAgentId: string;
+  runtimeProfileId?: string | null;
+  workspacePath: string;
+  agentDir?: string | null;
+  provisionStatus: string;
+  runtimeStatus: string;
+  lastHealthAt?: string | null;
+  lastError?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OpenClawStatus {
+  enabled: boolean;
+  configured: boolean;
+  gatewayUrl: string;
+  reachable: boolean;
+  protocol?: number | null;
+  version?: string | null;
+  lastError?: string | null;
+  checkedAt?: string | null;
+}
+
 export interface Destination {
   kind: 'desk' | 'room' | 'spawn' | 'location';
   id: string;
@@ -124,13 +151,16 @@ export interface Employee {
   department: string;
   title: string;
   status: string;
+  employmentStatus: 'ACTIVE' | 'SUSPENDED' | 'TERMINATING' | 'TERMINATED' | string;
   personality: PersonalityProfile;
   skills: SkillProfile[];
   appearance: AppearanceProfile;
   modelConfig: AgentModelConfig;
   modelProfileId?: string;
   modelProfile?: ModelProfileSummary;
+  runtimeBinding?: RuntimeBindingSummary | null;
   deskId?: string;
+  floorId?: string | null;
   hiredAt: string;
   currentState: ActorState;
   currentDestination?: Destination;
@@ -170,6 +200,49 @@ export interface TaskSummary {
   status: string;
   assigneeId?: string;
   goalId?: string;
+  previousAssigneeId?: string | null;
+  handoverStatus: string;
+}
+
+export interface TerminationTaskSummary {
+  id: string;
+  title: string;
+  status: string;
+  goalId?: string | null;
+}
+
+export interface TerminationPreview {
+  employee: Employee;
+  activeTaskCount: number;
+  runningJobCount: number;
+  activeGoalCount: number;
+  activeMeetingCount: number;
+  artifactCount: number;
+  workspacePath?: string | null;
+  workspaceStatus: string;
+  runtimeType: string;
+  runtimeStatus: string;
+  workstationId?: string | null;
+  unreadCount: number;
+  tasks: TerminationTaskSummary[];
+  activeTerminationId?: string | null;
+}
+
+export interface TerminationRecordSummary {
+  id: string;
+  companyId: string;
+  employeeId: string;
+  initiatedBy: string;
+  reason: string;
+  notes: string;
+  status: string;
+  workspaceAction: string;
+  taskHandoverStatus: string;
+  runtimeShutdownStatus: string;
+  workstationReleaseStatus: string;
+  createdAt: string;
+  effectiveAt?: string | null;
+  completedAt?: string | null;
 }
 
 export interface MeetingSummary {
@@ -199,6 +272,8 @@ export interface MessageRecord {
   createdAt: string;
   readAt?: string | null;
   jobId?: string | null;
+  meetingId?: string | null;
+  broadcastId?: string | null;
 }
 
 export interface EmployeeMessageHistoryState {
@@ -224,6 +299,7 @@ export interface AgentJobSummary {
   messageId?: string;
   goalId?: string;
   taskId?: string;
+  meetingId?: string | null;
   attempts: number;
   result?: string | null;
   error?: string | null;
@@ -339,6 +415,8 @@ export interface ActiveMovement {
 }
 
 export interface OfficeLayout {
+  floorId?: string | null;
+  floorName?: string | null;
   width: number;
   height: number;
   rooms: RoomDefinition[];
@@ -352,13 +430,105 @@ export interface OfficeLayout {
   movement: MovementConfig;
 }
 
+export interface FloorSummary {
+  id: string;
+  companyId: string;
+  floorNumber: number;
+  name: string;
+  description: string;
+  mission: string;
+  responsibilities: string[];
+  roles: FloorRoleSummary[];
+  status: string;
+  employeeCount: number;
+  workstationCount: number;
+  availableWorkstations: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface FloorRoleSummary {
+  id: string;
+  name: string;
+  responsibilities: string[];
+  skills: string[];
+  preferences: string[];
+}
+
+export interface WorkstationSummary {
+  id: string;
+  companyId: string;
+  floorId: string;
+  locationId: string;
+  roomId?: string | null;
+  x: number;
+  y: number;
+  orientation: string;
+  status: string;
+  assignedEmployeeId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface HiringPositionSummary {
+  id: string;
+  roleDefinitionId?: string | null;
+  title: string;
+  headcount: number;
+  requirements: string[];
+  preferences: string[];
+  status: string;
+}
+
+export interface CandidateSummary {
+  id: string;
+  hiringRequestId: string;
+  positionId: string;
+  name: string;
+  age: number;
+  gender: Gender;
+  title: string;
+  personality: PersonalityProfile;
+  skills: SkillProfile[];
+  workStyle: string;
+  strengths: string[];
+  weaknesses: string[];
+  expertise: string[];
+  expectedModel: string;
+  agentRuntime: string;
+  appearance: AppearanceProfile;
+  matchScore: number;
+  interviewEvaluation: string;
+  status: string;
+  hiredEmployeeId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface HiringRequestSummary {
+  id: string;
+  companyId: string;
+  floorId: string;
+  requesterId?: string | null;
+  summary: string;
+  status: string;
+  sourceMessageId?: string | null;
+  positions: HiringPositionSummary[];
+  candidates: CandidateSummary[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface CompanySnapshot {
   company: Company;
   employees: Employee[];
   goals: GoalSummary[];
   tasks: TaskSummary[];
   meetings: MeetingSummary[];
-  hiringRequests: unknown[];
+  floors: FloorSummary[];
+  activeFloorId: string;
+  workstations: WorkstationSummary[];
+  hiringRequests: HiringRequestSummary[];
   messages: MessageRecord[];
   unreadCounts: Record<string, number>;
   jobs: AgentJobSummary[];
@@ -369,6 +539,7 @@ export interface CompanySnapshot {
   tokenUsage: TokenUsageSummary;
   serverTime: string;
   recentEvents: DomainEvent[];
+  openclaw: OpenClawStatus;
 }
 
 export type BootstrapResponse = CompanySnapshot;
@@ -387,4 +558,6 @@ export interface CompanyStoreState {
   loading: boolean;
   error: string | null;
   connectionStatus: 'connecting' | 'connected' | 'disconnected';
+  activeFloorId: string | null;
+  terminationPreview: TerminationPreview | null;
 }

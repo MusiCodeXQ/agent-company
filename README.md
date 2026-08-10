@@ -17,7 +17,9 @@
 - 聊天中的“去洗手间 / 去卫生间 / 去厕所”会由确定性空间指令映射到 `toilet_entrance`，复用统一寻路和持久化 Movement，不调用 LLM 决定坐标。
 - PixiJS 不再自行规划路线或报告到达。它只根据 Snapshot 的 `serverTime`、`activeMovements.path`、`startedAt` 和 `estimatedArrivalAt` 做插值，并由 `AnimationController` 播放 idle/walk 视觉动作。
 - 会议流程使用同一套移动能力：创建会议后为每位参会者预留独立座位，所有人真实到达并坐下后才进入 `IN_PROGRESS`；结束会议后分别沿路线返回各自工位。
-- 本阶段不包含招聘、面试和真实 Coding Tool，也不提供脱离后端状态的演示操作；Mock Provider 只作为无 Key 的本地运行兜底。
+- 招聘、楼层和基础入职移动流程已经保留在当前版本；真实 Coding Tool、完整 Company Bridge 和复杂多 Agent 自主规划仍未启用。Mock Provider 继续作为无 Key 的本地运行兜底。
+- 员工离职采用持久化 Offboarding 流程：预览影响、任务交接、取消新 Job、撤销权限、停止/归档 Runtime、释放工位，员工沿办公室入口路线离开；员工记录、聊天、会议和任务历史不会被删除。
+- OpenClaw 是可选的 Agent Runtime。数据库保存每个员工的 Runtime binding、Workspace 和运行事件；只有在“大模型”页面显式 Provision 后，该员工才会切换到 OpenClaw，其他员工仍可使用 Mock 或 OpenAI Compatible Provider。
 
 ## 启动
 
@@ -56,7 +58,28 @@ HOST=0.0.0.0
 PORT=3001
 DATABASE_URL=sqlite://data/ai_company.db?mode=rwc
 MODEL_PROFILE_ENCRYPTION_KEY=your-local-encryption-secret
+OPENCLAW_ENABLED=false
+OPENCLAW_GATEWAY_URL=ws://127.0.0.1:18789
+OPENCLAW_GATEWAY_TOKEN=
+OPENCLAW_PROTOCOL_VERSION=4
+OPENCLAW_WORKSPACE_ROOT=data/openclaw/workspaces
 ```
+
+### OpenClaw 可选接入
+
+如果只验证本项目的 Mock 或 OpenAI Compatible Provider，不需要安装 OpenClaw，也不需要登录 OpenClaw。要让某个员工真正由 OpenClaw 执行，则需要在运行 Rust 后端的环境中安装并完成 OpenClaw 的本地初始化/模型配置，启动 Gateway，取得 Gateway token，然后设置 `OPENCLAW_ENABLED=true`、`OPENCLAW_GATEWAY_TOKEN` 和对应的 Gateway 地址。浏览器不会接触这个 token。
+
+```bash
+openclaw onboard --mode local
+openclaw gateway status --require-rpc
+openclaw gateway auth-token --show
+```
+
+服务启动后，在“大模型”页测试 Gateway，并对目标员工点击“绑定 OpenClaw”。Provision 会创建隔离 Workspace 和 Agent；员工消息仍先落 SQLite，再由 Rust Worker 通过 Gateway WebSocket 投递。OpenClaw 不可用时不会影响 Mock 模式启动，但已绑定 OpenClaw 的 Job 会记录失败并等待运行时恢复。
+
+### 员工离职 Demo
+
+点击员工档案中的“解雇”，先查看未完成任务、Job、Goal、会议、Workspace、Runtime 和工位影响，再二次确认。也可以直接与 HR 苏晴发送“把张晨解雇掉”，HR 会先返回影响预览；回复“继续”才会启动流程。终止中的员工不会再接受新消息，完成后从办公室画布隐藏，但仍可在员工目录中查看手机历史、工作记录和离职状态。
 
 ## 人工验证第二阶段 Demo
 

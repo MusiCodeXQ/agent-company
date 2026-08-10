@@ -10,7 +10,8 @@ use crate::model_profiles;
 use crate::models::{
     AgentJobSummary, AgentMemoryRecord, AgentModelConfig, AgentMovementSummary, Company, Employee,
     GoalSummary, MeetingParticipantSummary, MeetingSummary, MessageRecord, ModelProfileSummary,
-    MovementPoint, PersonalityProfile, SkillProfile, TaskSummary, TokenUsageSummary,
+    MovementPoint, PersonalityProfile, RuntimeBindingSummary, SkillProfile, TaskSummary,
+    TokenUsageSummary,
 };
 use crate::office;
 
@@ -25,12 +26,14 @@ struct EmployeeRow {
     department: String,
     title: String,
     status: String,
+    employment_status: String,
     personality: String,
     skills: String,
     appearance: String,
     model_config: String,
     model_profile_id: Option<String>,
     desk_id: Option<String>,
+    floor_id: Option<String>,
     hired_at: String,
     current_state: String,
     current_destination: Option<String>,
@@ -49,6 +52,18 @@ struct EmployeeRow {
     output_tokens: i64,
     cache_tokens: i64,
     total_tokens: i64,
+    runtime_binding_id: Option<String>,
+    runtime_type: Option<String>,
+    runtime_agent_id: Option<String>,
+    runtime_profile_id: Option<String>,
+    workspace_path: Option<String>,
+    agent_dir: Option<String>,
+    provision_status: Option<String>,
+    runtime_status: Option<String>,
+    last_health_at: Option<String>,
+    runtime_last_error: Option<String>,
+    runtime_created_at: Option<String>,
+    runtime_updated_at: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -109,6 +124,39 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .await?;
 
     sqlx::query(
+        "INSERT OR IGNORE INTO floors
+         (id, company_id, floor_number, name, description, mission, responsibilities,
+          status, created_at, updated_at)
+         VALUES ('floor-01', 'company-01', 1, '基础办公层',
+                 '公司初始化时的基础办公空间。',
+                 '承载公司的日常协作与 Agent Runtime。',
+                 '[\"日常协作\", \"消息处理\", \"任务执行\"]',
+                 'ACTIVE', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO role_definitions
+         (id, company_id, floor_id, name, responsibilities, skills, preferences, created_at, updated_at)
+         VALUES
+           ('role-floor-01-hr', 'company-01', 'floor-01', 'HR',
+            '[\"理解招聘需求\", \"维护候选人流程\", \"协助员工入职\"]',
+            '[\"沟通\", \"人才评估\", \"组织协调\"]', '[]', ?, ?),
+           ('role-floor-01-admin', 'company-01', 'floor-01', '管理员',
+            '[\"维护楼层配置\", \"管理工位与空间资源\", \"协助公司运行\"]',
+            '[\"组织管理\", \"资源协调\", \"流程执行\"]', '[]', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
         "INSERT OR IGNORE INTO model_profiles
          (id, company_id, name, protocol, base_url, encrypted_api_key, api_key_hint,
           model, enabled, created_at, updated_at)
@@ -116,6 +164,24 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                  'mock-office-v1', 1, ?, ?)",
     )
     .bind("company-01")
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO runtime_profiles
+         (id, company_id, name, runtime_owner, model_profile_id, sandbox_profile_id,
+          tool_policy, skills, mcp_policy, config, enabled, created_at, updated_at)
+         VALUES ('runtime-profile-mock-01', 'company-01', 'Native Mock Runtime', 'MOCK',
+                 'mock-profile-01', NULL, '{}', '[]', '{}', '{}', 1, ?, ?),
+                ('runtime-profile-openclaw-01', 'company-01', 'OpenClaw Agent Runtime', 'OPENCLAW',
+                 'mock-profile-01', NULL,
+                 '{\"companyTools\":true,\"sessionsSend\":false}',
+                 '[\"company-bridge\"]', '{}', '{}', 1, ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -157,11 +223,15 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .await?;
     }
 
+    for employee in default_employees() {
+        ensure_employee_runtime_binding(pool, "company-01", &employee.id).await?;
+    }
+
     for location in &office_layout.locations {
         sqlx::query(
             "INSERT OR IGNORE INTO office_locations
-             (id, company_id, name, type, room_id, x, y, created_at)
-             VALUES (?, 'company-01', ?, ?, ?, ?, ?, ?)",
+             (id, company_id, name, type, room_id, x, y, floor_id, created_at)
+             VALUES (?, 'company-01', ?, ?, ?, ?, ?, 'floor-01', ?)",
         )
         .bind(&location.id)
         .bind(&location.name)
@@ -170,6 +240,67 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .bind(f64::from(location.x))
         .bind(f64::from(location.y))
         .bind(&now)
+        .execute(pool)
+        .await?;
+    }
+
+    sqlx::query(
+        "UPDATE office_locations SET floor_id = 'floor-01'
+         WHERE company_id = 'company-01' AND floor_id IS NULL",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE employees SET floor_id = 'floor-01'
+         WHERE company_id = 'company-01' AND floor_id IS NULL",
+    )
+    .execute(pool)
+    .await?;
+
+    for desk in &office_layout.desks {
+        let location_id = office::workstation_location_id(&desk.employee_id);
+        let room_id = office_layout
+            .locations
+            .iter()
+            .find(|location| location.id == location_id)
+            .and_then(|location| location.room_id.clone())
+            .unwrap_or_else(|| "open-office".to_string());
+        let assigned_employee_id = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM employees WHERE company_id = 'company-01' AND id = ?",
+        )
+        .bind(&desk.employee_id)
+        .fetch_optional(pool)
+        .await?;
+        let workstation_status = if assigned_employee_id.is_some() {
+            "OCCUPIED"
+        } else {
+            "AVAILABLE"
+        };
+        sqlx::query(
+            "INSERT OR IGNORE INTO workstations
+             (id, company_id, floor_id, location_id, room_id, position_x, position_y,
+              orientation, status, assigned_employee_id, created_at, updated_at)
+             VALUES (?, 'company-01', 'floor-01', ?, ?, ?, ?, 'DOWN', ?, ?, ?, ?)",
+        )
+        .bind(&desk.id)
+        .bind(&location_id)
+        .bind(&room_id)
+        .bind(f64::from(desk.x))
+        .bind(f64::from(desk.y))
+        .bind(workstation_status)
+        .bind(&assigned_employee_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "UPDATE workstations SET assigned_employee_id = ?, status = ?, updated_at = ?
+             WHERE company_id = 'company-01' AND id = ?",
+        )
+        .bind(&assigned_employee_id)
+        .bind(workstation_status)
+        .bind(&now)
+        .bind(&desk.id)
         .execute(pool)
         .await?;
     }
@@ -399,8 +530,10 @@ pub async fn employees(pool: &SqlitePool, company_id: &str) -> Result<Vec<Employ
         .map(|profile| (profile.id.clone(), profile))
         .collect::<HashMap<_, _>>();
     let rows = sqlx::query_as::<_, EmployeeRow>(
-        "SELECT id, company_id, name, age, gender, role, department, title, status,
-                personality, skills, appearance, model_config, model_profile_id, desk_id,
+        "SELECT employees.id, employees.company_id, employees.name, employees.age, employees.gender,
+                employees.role, employees.department, employees.title, employees.status,
+                employees.employment_status,
+                personality, skills, appearance, model_config, model_profile_id, desk_id, floor_id,
                 hired_at, current_state, current_destination,
                 activity, movement, location_id, position_x, position_y, room_id,
                 device, posture, presence, active_movement_id,
@@ -414,8 +547,22 @@ pub async fn employees(pool: &SqlitePool, company_id: &str) -> Result<Vec<Employ
                 COALESCE(usage.input_tokens, 0) AS input_tokens,
                 COALESCE(usage.output_tokens, 0) AS output_tokens,
                 COALESCE(usage.cache_tokens, 0) AS cache_tokens,
-                COALESCE(usage.total_tokens, 0) AS total_tokens
+                COALESCE(usage.total_tokens, 0) AS total_tokens,
+                binding.id AS runtime_binding_id,
+                binding.runtime_type,
+                binding.runtime_agent_id,
+                binding.runtime_profile_id,
+                binding.workspace_path,
+                binding.agent_dir,
+                binding.provision_status,
+                binding.runtime_status,
+                binding.last_health_at,
+                binding.last_error AS runtime_last_error,
+                binding.created_at AS runtime_created_at,
+                binding.updated_at AS runtime_updated_at
          FROM employees
+         LEFT JOIN employee_runtime_bindings binding
+           ON binding.employee_id = employees.id AND binding.company_id = employees.company_id
          LEFT JOIN (
              SELECT employee_id,
                     SUM(input_tokens) AS input_tokens,
@@ -426,7 +573,7 @@ pub async fn employees(pool: &SqlitePool, company_id: &str) -> Result<Vec<Employ
              WHERE company_id = ? AND status = 'COMPLETED'
              GROUP BY employee_id
          ) usage ON usage.employee_id = employees.id
-         WHERE employees.company_id = ? ORDER BY hired_at, id",
+         WHERE employees.company_id = ? ORDER BY employees.hired_at, employees.id",
     )
     .bind(company_id)
     .bind(company_id)
@@ -437,6 +584,169 @@ pub async fn employees(pool: &SqlitePool, company_id: &str) -> Result<Vec<Employ
         .into_iter()
         .map(|row| employee_from_row(row, &profiles))
         .collect())
+}
+
+pub async fn ensure_employee_runtime_binding(
+    pool: &SqlitePool,
+    company_id: &str,
+    employee_id: &str,
+) -> Result<(), sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    let runtime_agent_id = format!("company_{employee_id}");
+    let workspace_path = format!("data/openclaw/workspaces/{runtime_agent_id}");
+    sqlx::query(
+        "INSERT OR IGNORE INTO employee_runtime_bindings
+         (id, company_id, employee_id, runtime_type, runtime_agent_id, runtime_profile_id,
+          workspace_path, agent_dir, provision_status, runtime_status, created_at, updated_at)
+         VALUES (?, ?, ?, 'MOCK', ?, 'runtime-profile-mock-01', ?, NULL,
+                 'READY', 'ACTIVE', ?, ?)",
+    )
+    .bind(format!("runtime-binding-{employee_id}"))
+    .bind(company_id)
+    .bind(employee_id)
+    .bind(&runtime_agent_id)
+    .bind(&workspace_path)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_openclaw_runtime_binding(
+    pool: &SqlitePool,
+    company_id: &str,
+    employee_id: &str,
+    runtime_agent_id: &str,
+    workspace_path: &str,
+    agent_dir: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE employee_runtime_bindings
+         SET runtime_type = 'OPENCLAW', runtime_agent_id = ?,
+             runtime_profile_id = 'runtime-profile-openclaw-01', workspace_path = ?,
+             agent_dir = ?, provision_status = 'READY', runtime_status = 'ACTIVE',
+             last_error = NULL, updated_at = ?
+         WHERE company_id = ? AND employee_id = ?",
+    )
+    .bind(runtime_agent_id)
+    .bind(workspace_path)
+    .bind(agent_dir)
+    .bind(&now)
+    .bind(company_id)
+    .bind(employee_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn update_runtime_binding_status(
+    pool: &SqlitePool,
+    company_id: &str,
+    employee_id: &str,
+    provision_status: Option<&str>,
+    runtime_status: Option<&str>,
+    last_error: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE employee_runtime_bindings
+         SET provision_status = COALESCE(?, provision_status),
+             runtime_status = COALESCE(?, runtime_status),
+             last_error = ?, updated_at = ?
+         WHERE company_id = ? AND employee_id = ?",
+    )
+    .bind(provision_status)
+    .bind(runtime_status)
+    .bind(last_error)
+    .bind(&now)
+    .bind(company_id)
+    .bind(employee_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn touch_runtime_health(
+    pool: &SqlitePool,
+    company_id: &str,
+    employee_id: &str,
+    last_error: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE employee_runtime_bindings
+         SET last_health_at = ?, last_error = ?, updated_at = ?
+         WHERE company_id = ? AND employee_id = ?",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(last_error)
+    .bind(Utc::now().to_rfc3339())
+    .bind(company_id)
+    .bind(employee_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn record_runtime_event(
+    pool: &SqlitePool,
+    company_id: &str,
+    employee_id: Option<&str>,
+    runtime_agent_id: Option<&str>,
+    run_id: Option<&str>,
+    event_type: &str,
+    payload: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO runtime_events
+         (id, company_id, employee_id, runtime_agent_id, run_id, event_type, payload, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(format!("runtime-event-{}", Uuid::new_v4()))
+    .bind(company_id)
+    .bind(employee_id)
+    .bind(runtime_agent_id)
+    .bind(run_id)
+    .bind(event_type)
+    .bind(payload)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn upsert_runtime_session_binding(
+    pool: &SqlitePool,
+    company_id: &str,
+    employee_id: &str,
+    context_type: &str,
+    context_id: &str,
+    runtime_session_key: &str,
+) -> Result<(), sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO runtime_session_bindings
+         (id, company_id, employee_id, context_type, context_id, runtime_session_key,
+          last_used_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(employee_id, context_type, context_id) DO UPDATE SET
+           runtime_session_key = excluded.runtime_session_key,
+           last_used_at = excluded.last_used_at,
+           updated_at = excluded.updated_at",
+    )
+    .bind(format!("runtime-session-{}", Uuid::new_v4()))
+    .bind(company_id)
+    .bind(employee_id)
+    .bind(context_type)
+    .bind(context_id)
+    .bind(runtime_session_key)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn set_employee_model_profile(
@@ -466,7 +776,8 @@ pub async fn set_employee_model_profile(
 
 pub async fn tasks(pool: &SqlitePool, company_id: &str) -> Result<Vec<TaskSummary>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT id, title, description, type, status, assignee_id, goal_id
+        "SELECT id, title, description, type, status, assignee_id, goal_id,
+                previous_assignee_id, handover_status
          FROM tasks WHERE company_id = ? ORDER BY created_at",
     )
     .bind(company_id)
@@ -482,6 +793,8 @@ pub async fn tasks(pool: &SqlitePool, company_id: &str) -> Result<Vec<TaskSummar
                 status: row.try_get("status")?,
                 assignee_id: row.try_get("assignee_id")?,
                 goal_id: row.try_get("goal_id")?,
+                previous_assignee_id: row.try_get("previous_assignee_id")?,
+                handover_status: row.try_get("handover_status")?,
             })
         })
         .collect()
@@ -560,7 +873,7 @@ pub async fn messages(
 ) -> Result<Vec<MessageRecord>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, company_id, from_type, from_id, to_type, to_id, content,
-                created_at, read_at, job_id
+                created_at, read_at, job_id, meeting_id, broadcast_id
          FROM messages
          WHERE company_id = ?
          ORDER BY created_at DESC, id DESC
@@ -583,6 +896,8 @@ pub async fn messages(
                 created_at: row.try_get("created_at")?,
                 read_at: row.try_get("read_at")?,
                 job_id: row.try_get("job_id")?,
+                meeting_id: row.try_get("meeting_id")?,
+                broadcast_id: row.try_get("broadcast_id")?,
             })
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
@@ -597,7 +912,7 @@ pub async fn messages_for_employee(
 ) -> Result<Vec<MessageRecord>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, company_id, from_type, from_id, to_type, to_id, content,
-                created_at, read_at, job_id
+                created_at, read_at, job_id, meeting_id, broadcast_id
          FROM messages
          WHERE company_id = ?
            AND ((from_id = ? AND to_type = 'user') OR (from_type = 'user' AND to_id = ?))
@@ -623,6 +938,8 @@ pub async fn messages_for_employee(
                 created_at: row.try_get("created_at")?,
                 read_at: row.try_get("read_at")?,
                 job_id: row.try_get("job_id")?,
+                meeting_id: row.try_get("meeting_id")?,
+                broadcast_id: row.try_get("broadcast_id")?,
             })
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
@@ -642,7 +959,7 @@ pub async fn messages_for_employee_page(
         Some(before) => {
             sqlx::query(
                 "SELECT id, company_id, from_type, from_id, to_type, to_id, content,
-                        created_at, read_at, job_id
+                        created_at, read_at, job_id, meeting_id, broadcast_id
                  FROM messages
                  WHERE company_id = ?
                    AND ((from_id = ? AND to_type = 'user') OR (from_type = 'user' AND to_id = ?))
@@ -661,7 +978,7 @@ pub async fn messages_for_employee_page(
         None => {
             sqlx::query(
                 "SELECT id, company_id, from_type, from_id, to_type, to_id, content,
-                        created_at, read_at, job_id
+                        created_at, read_at, job_id, meeting_id, broadcast_id
                  FROM messages
                  WHERE company_id = ?
                    AND ((from_id = ? AND to_type = 'user') OR (from_type = 'user' AND to_id = ?))
@@ -691,6 +1008,8 @@ pub async fn messages_for_employee_page(
                 created_at: row.try_get("created_at")?,
                 read_at: row.try_get("read_at")?,
                 job_id: row.try_get("job_id")?,
+                meeting_id: row.try_get("meeting_id")?,
+                broadcast_id: row.try_get("broadcast_id")?,
             })
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
@@ -1073,7 +1392,9 @@ pub async fn complete_movement(
         "UPDATE employees
          SET location_id = ?, position_x = ?, position_y = ?, room_id = ?,
              movement = 'ARRIVED', posture = ?, active_movement_id = NULL,
-             current_destination = NULL
+             current_destination = NULL,
+             presence = CASE WHEN ? = 'WORKSTATION' THEN 'AVAILABLE' ELSE presence END,
+             activity = CASE WHEN ? = 'WORKSTATION' THEN 'IDLE' ELSE activity END
          WHERE id = ? AND company_id = ?",
     )
     .bind(&row.to_location_id)
@@ -1081,6 +1402,8 @@ pub async fn complete_movement(
     .bind(y)
     .bind(&room_id)
     .bind(posture)
+    .bind(&location_type)
+    .bind(&location_type)
     .bind(&row.agent_id)
     .bind(&row.company_id)
     .execute(&mut *tx)
@@ -1154,6 +1477,7 @@ pub struct AgentJob {
     pub employee_id: String,
     pub goal_id: Option<String>,
     pub task_id: Option<String>,
+    pub meeting_id: Option<String>,
     pub payload: String,
     pub attempts: i64,
 }
@@ -1168,6 +1492,7 @@ struct AgentJobRow {
     message_id: Option<String>,
     goal_id: Option<String>,
     task_id: Option<String>,
+    meeting_id: Option<String>,
     payload: String,
     result: Option<String>,
     error: Option<String>,
@@ -1183,7 +1508,7 @@ pub async fn jobs(
 ) -> Result<Vec<AgentJobSummary>, sqlx::Error> {
     let rows = sqlx::query_as::<_, AgentJobRow>(
         "SELECT id, company_id, job_type, status, employee_id, message_id, goal_id, task_id,
-                payload, result, error, attempts, available_at, created_at, updated_at
+                meeting_id, payload, result, error, attempts, available_at, created_at, updated_at
          FROM agent_jobs WHERE company_id = ? ORDER BY created_at DESC LIMIT 100",
     )
     .bind(company_id)
@@ -1199,11 +1524,18 @@ pub async fn create_message_job(
     content: &str,
 ) -> Result<(MessageRecord, AgentJob), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query("SELECT id FROM employees WHERE company_id = ? AND id = ?")
-        .bind(company_id)
-        .bind(employee_id)
-        .fetch_one(&mut *tx)
-        .await?;
+    let employee_row =
+        sqlx::query("SELECT id, employment_status FROM employees WHERE company_id = ? AND id = ?")
+            .bind(company_id)
+            .bind(employee_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let employment_status: String = employee_row.try_get("employment_status")?;
+    if employment_status != "ACTIVE" {
+        return Err(sqlx::Error::Protocol(format!(
+            "employee {employee_id} is not accepting new work ({employment_status})"
+        )));
+    }
     let task = sqlx::query(
         "SELECT id, goal_id FROM tasks WHERE company_id = ? AND assignee_id = ?
          AND status IN ('READY', 'IN_PROGRESS', 'PENDING') ORDER BY created_at LIMIT 1",
@@ -1267,6 +1599,8 @@ pub async fn create_message_job(
             created_at: now.clone(),
             read_at: None,
             job_id: Some(job_id.clone()),
+            meeting_id: None,
+            broadcast_id: None,
         },
         AgentJob {
             id: job_id,
@@ -1276,10 +1610,148 @@ pub async fn create_message_job(
             employee_id: employee_id.to_string(),
             goal_id,
             task_id,
+            meeting_id: None,
             payload: serde_json::json!({ "content": content }).to_string(),
             attempts: 0,
         },
     ))
+}
+
+pub struct MeetingMessageBatch {
+    pub meeting_id: String,
+    pub broadcast_id: String,
+    pub messages: Vec<MessageRecord>,
+    pub jobs: Vec<AgentJob>,
+}
+
+/// Creates one durable message/job pair for every participant currently seated
+/// at the meeting table. The broadcast id lets clients render the CEO's message
+/// once while each Agent still receives an independent runtime job.
+pub async fn create_meeting_message_jobs(
+    pool: &SqlitePool,
+    company_id: &str,
+    meeting_id: &str,
+    content: &str,
+) -> Result<MeetingMessageBatch, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let participant_rows = sqlx::query(
+        "SELECT p.agent_id FROM meeting_participants p
+         INNER JOIN meetings m ON m.id = p.meeting_id AND m.company_id = ?
+         INNER JOIN employees e ON e.id = p.agent_id AND e.company_id = m.company_id
+         WHERE p.meeting_id = ? AND p.status IN ('ARRIVED', 'WAITING', 'JOINED')
+           AND e.employment_status = 'ACTIVE'
+         ORDER BY p.created_at",
+    )
+    .bind(company_id)
+    .bind(meeting_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let participant_ids = participant_rows
+        .into_iter()
+        .map(|row| row.try_get::<String, _>("agent_id"))
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    let broadcast_id = format!("broadcast-{}", Uuid::new_v4());
+    let now = Utc::now().to_rfc3339();
+    let mut messages = Vec::with_capacity(participant_ids.len());
+    let mut jobs = Vec::with_capacity(participant_ids.len());
+
+    for employee_id in participant_ids {
+        let task = sqlx::query(
+            "SELECT id, goal_id FROM tasks WHERE company_id = ? AND assignee_id = ?
+             AND status IN ('READY', 'IN_PROGRESS', 'PENDING') ORDER BY created_at LIMIT 1",
+        )
+        .bind(company_id)
+        .bind(&employee_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let task_id = task
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<String>, _>("id").ok())
+            .flatten();
+        let goal_id = task
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<String>, _>("goal_id").ok())
+            .flatten();
+        let message_id = format!("msg-{}", Uuid::new_v4());
+        let job_id = format!("job-{}", Uuid::new_v4());
+        let payload = serde_json::json!({
+            "messageId": message_id,
+            "content": content,
+            "meetingId": meeting_id,
+            "broadcastId": broadcast_id,
+        })
+        .to_string();
+
+        sqlx::query(
+            "INSERT INTO messages
+             (id, company_id, from_type, from_id, to_type, to_id, content, created_at,
+              job_id, meeting_id, broadcast_id)
+             VALUES (?, ?, 'user', 'user', 'employee', ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&message_id)
+        .bind(company_id)
+        .bind(&employee_id)
+        .bind(content)
+        .bind(&now)
+        .bind(&job_id)
+        .bind(meeting_id)
+        .bind(&broadcast_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent_jobs
+             (id, company_id, job_type, status, employee_id, message_id, goal_id, task_id,
+              meeting_id, payload, attempts, available_at, created_at, updated_at)
+             VALUES (?, ?, 'MESSAGE_RESPONSE', 'PENDING', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+        )
+        .bind(&job_id)
+        .bind(company_id)
+        .bind(&employee_id)
+        .bind(&message_id)
+        .bind(&goal_id)
+        .bind(&task_id)
+        .bind(meeting_id)
+        .bind(&payload)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        messages.push(MessageRecord {
+            id: message_id,
+            company_id: company_id.to_string(),
+            from_type: "user".to_string(),
+            from_id: "user".to_string(),
+            to_type: "employee".to_string(),
+            to_id: employee_id.clone(),
+            content: content.to_string(),
+            created_at: now.clone(),
+            read_at: None,
+            job_id: Some(job_id.clone()),
+            meeting_id: Some(meeting_id.to_string()),
+            broadcast_id: Some(broadcast_id.clone()),
+        });
+        jobs.push(AgentJob {
+            id: job_id,
+            company_id: company_id.to_string(),
+            job_type: "MESSAGE_RESPONSE".to_string(),
+            status: "PENDING".to_string(),
+            employee_id,
+            goal_id,
+            task_id,
+            meeting_id: Some(meeting_id.to_string()),
+            payload,
+            attempts: 0,
+        });
+    }
+    tx.commit().await?;
+    Ok(MeetingMessageBatch {
+        meeting_id: meeting_id.to_string(),
+        broadcast_id,
+        messages,
+        jobs,
+    })
 }
 
 pub async fn recover_running_jobs(pool: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -1293,11 +1765,19 @@ pub async fn recover_running_jobs(pool: &SqlitePool) -> Result<(), sqlx::Error> 
     Ok(())
 }
 
+pub async fn job_is_cancelled(pool: &SqlitePool, job_id: &str) -> Result<bool, sqlx::Error> {
+    let status = sqlx::query_scalar::<_, String>("SELECT status FROM agent_jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(status.as_deref() == Some("CANCELLED"))
+}
+
 pub async fn claim_next_job(pool: &SqlitePool) -> Result<Option<AgentJob>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, AgentJobRow>(
         "SELECT id, company_id, job_type, status, employee_id, message_id, goal_id, task_id,
-                payload, result, error, attempts, available_at, created_at, updated_at
+                meeting_id, payload, result, error, attempts, available_at, created_at, updated_at
          FROM agent_jobs WHERE status = 'PENDING' AND available_at <= ?
          ORDER BY created_at LIMIT 1",
     )
@@ -1328,6 +1808,7 @@ pub async fn claim_next_job(pool: &SqlitePool) -> Result<Option<AgentJob>, sqlx:
         employee_id: row.employee_id,
         goal_id: row.goal_id,
         task_id: row.task_id,
+        meeting_id: row.meeting_id,
         payload: row.payload,
         attempts: row.attempts + 1,
     }))
@@ -1341,7 +1822,8 @@ pub async fn finish_job(
     error: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE agent_jobs SET status = ?, result = ?, error = ?, updated_at = ? WHERE id = ?",
+        "UPDATE agent_jobs SET status = ?, result = ?, error = ?, updated_at = ?
+         WHERE id = ? AND status != 'CANCELLED'",
     )
     .bind(status)
     .bind(result)
@@ -1382,13 +1864,16 @@ pub async fn insert_agent_reply(
     employee_id: &str,
     content: &str,
     job_id: &str,
+    meeting_id: Option<&str>,
+    broadcast_id: Option<&str>,
 ) -> Result<MessageRecord, sqlx::Error> {
     let id = format!("msg-{}", Uuid::new_v4());
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO messages
-         (id, company_id, from_type, from_id, to_type, to_id, content, created_at, job_id)
-         VALUES (?, ?, 'employee', ?, 'user', 'user', ?, ?, ?)",
+         (id, company_id, from_type, from_id, to_type, to_id, content, created_at,
+          job_id, meeting_id, broadcast_id)
+         VALUES (?, ?, 'employee', ?, 'user', 'user', ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(company_id)
@@ -1396,6 +1881,8 @@ pub async fn insert_agent_reply(
     .bind(content)
     .bind(&now)
     .bind(job_id)
+    .bind(meeting_id)
+    .bind(broadcast_id)
     .execute(pool)
     .await?;
     Ok(MessageRecord {
@@ -1409,6 +1896,8 @@ pub async fn insert_agent_reply(
         created_at: now,
         read_at: None,
         job_id: Some(job_id.to_string()),
+        meeting_id: meeting_id.map(str::to_string),
+        broadcast_id: broadcast_id.map(str::to_string),
     })
 }
 
@@ -1418,7 +1907,7 @@ pub async fn agent_reply_for_job(
 ) -> Result<Option<MessageRecord>, sqlx::Error> {
     let row = sqlx::query(
         "SELECT id, company_id, from_type, from_id, to_type, to_id, content,
-                created_at, read_at, job_id
+                created_at, read_at, job_id, meeting_id, broadcast_id
          FROM messages
          WHERE job_id = ? AND from_type = 'employee' AND to_type = 'user'
          ORDER BY created_at LIMIT 1",
@@ -1438,6 +1927,8 @@ pub async fn agent_reply_for_job(
             created_at: row.try_get("created_at")?,
             read_at: row.try_get("read_at")?,
             job_id: row.try_get("job_id")?,
+            meeting_id: row.try_get("meeting_id")?,
+            broadcast_id: row.try_get("broadcast_id")?,
         })
     })
     .transpose()
@@ -1453,6 +1944,7 @@ fn job_summary(row: AgentJobRow) -> AgentJobSummary {
         message_id: row.message_id,
         goal_id: row.goal_id,
         task_id: row.task_id,
+        meeting_id: row.meeting_id,
         attempts: row.attempts,
         result: row.result,
         error: row.error,
@@ -1465,8 +1957,9 @@ fn employee_from_row(
     row: EmployeeRow,
     profiles: &HashMap<String, ModelProfileSummary>,
 ) -> Employee {
+    let employee_id = row.id.clone();
     Employee {
-        id: row.id,
+        id: employee_id.clone(),
         company_id: row.company_id,
         name: row.name,
         age: row.age.clamp(0, 255) as u8,
@@ -1475,6 +1968,7 @@ fn employee_from_row(
         department: row.department,
         title: row.title,
         status: row.status,
+        employment_status: row.employment_status,
         personality: serde_json::from_str(&row.personality).unwrap_or_default(),
         skills: serde_json::from_str(&row.skills).unwrap_or_default(),
         appearance: serde_json::from_str(&row.appearance).unwrap_or_default(),
@@ -1484,7 +1978,35 @@ fn employee_from_row(
             .as_ref()
             .and_then(|profile_id| profiles.get(profile_id).cloned()),
         model_profile_id: row.model_profile_id,
+        runtime_binding: row
+            .runtime_binding_id
+            .clone()
+            .map(|id| RuntimeBindingSummary {
+                id,
+                employee_id,
+                runtime_type: row
+                    .runtime_type
+                    .clone()
+                    .unwrap_or_else(|| "MOCK".to_string()),
+                runtime_agent_id: row.runtime_agent_id.clone().unwrap_or_default(),
+                runtime_profile_id: row.runtime_profile_id.clone(),
+                workspace_path: row.workspace_path.clone().unwrap_or_default(),
+                agent_dir: row.agent_dir.clone(),
+                provision_status: row
+                    .provision_status
+                    .clone()
+                    .unwrap_or_else(|| "PENDING".to_string()),
+                runtime_status: row
+                    .runtime_status
+                    .clone()
+                    .unwrap_or_else(|| "ACTIVE".to_string()),
+                last_health_at: row.last_health_at.clone(),
+                last_error: row.runtime_last_error.clone(),
+                created_at: row.runtime_created_at.clone().unwrap_or_default(),
+                updated_at: row.runtime_updated_at.clone().unwrap_or_default(),
+            }),
         desk_id: row.desk_id,
+        floor_id: row.floor_id,
         hired_at: row.hired_at,
         current_state: row.current_state,
         current_destination: row

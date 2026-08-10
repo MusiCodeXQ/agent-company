@@ -1,22 +1,36 @@
 import { create } from 'zustand';
 import {
+  createFloor as createFloorApi,
   createModelProfile,
+  createWorkstation as createWorkstationApi,
   bindEmployeeModelProfile,
   createMeeting,
+  deleteFloor as deleteFloorApi,
   EMPLOYEE_MESSAGE_PAGE_SIZE,
   fetchEmployeeMemory,
   fetchEmployeeMessages,
   fetchSnapshot,
   finishMeeting,
+  hireCandidate as hireCandidateApi,
   markEmployeeMessagesRead,
   openCompanyWebSocket,
+  sendMeetingMessage,
   sendCompanyMessage,
   sendEmployeeMessage,
+  fetchOpenClawStatus,
+  fetchTerminationPreview,
+  provisionEmployeeRuntime as provisionEmployeeRuntimeApi,
+  terminateEmployee as terminateEmployeeApi,
   testModelProfile,
+  updateFloor as updateFloorApi,
   updateModelProfile,
   type MessageSendResponse,
+  type FloorInput,
+  type FloorUpdateInput,
+  type HireCandidateResponse,
   type ModelProfileInput,
   type ModelProfileUpdate,
+  type TerminationInput,
 } from '../api/client';
 import {
   normalizeActorState,
@@ -28,13 +42,17 @@ import {
   type Destination,
   type DomainEvent,
   type Employee,
+  type FloorSummary,
+  type HiringRequestSummary,
   type MessageRecord,
   type ModelProfileSummary,
+  type OpenClawStatus,
   type TokenUsageSummary,
 } from '../domain/types';
 
 interface CompanyStoreActions {
-  loadBootstrap: () => Promise<void>;
+  loadBootstrap: (floorId?: string) => Promise<void>;
+  loadFloor: (floorId: string) => Promise<void>;
   connectWebSocket: () => () => void;
   applyEvent: (event: DomainEvent) => void;
   selectEmployee: (employeeId: string | null) => void;
@@ -43,6 +61,7 @@ interface CompanyStoreActions {
   loadConversation: (employeeId: string) => Promise<void>;
   loadOlderConversation: (employeeId: string) => Promise<boolean>;
   sendAgentMessage: (employeeId: string, content: string) => Promise<void>;
+  sendMeetingMessage: (meetingId: string, content: string) => Promise<void>;
   markRead: (employeeId: string) => Promise<void>;
   loadMemory: (employeeId: string) => Promise<void>;
   saveProvider: (input: ModelProfileInput, profileId?: string) => Promise<void>;
@@ -51,6 +70,16 @@ interface CompanyStoreActions {
   sendMessage: (content: string) => Promise<void>;
   startMeeting: (participantIds: string[]) => Promise<void>;
   finishMeeting: (meetingId: string) => Promise<void>;
+  createFloor: (input: FloorInput) => Promise<void>;
+  updateFloor: (floorId: string, input: FloorUpdateInput) => Promise<void>;
+  deleteFloor: (floorId: string) => Promise<void>;
+  createWorkstation: (floorId: string) => Promise<void>;
+  hireCandidate: (requestId: string, candidateId: string, workstationId?: string) => Promise<HireCandidateResponse>;
+  loadTerminationPreview: (employeeId: string) => Promise<void>;
+  clearTerminationPreview: () => void;
+  terminateEmployee: (employeeId: string, input: TerminationInput) => Promise<void>;
+  testOpenClaw: () => Promise<OpenClawStatus>;
+  provisionEmployeeRuntime: (employeeId: string) => Promise<void>;
 }
 
 type CompanyStore = CompanyStoreState & CompanyStoreActions;
@@ -62,6 +91,7 @@ function updateEmployee(employees: Employee[], employeeId: string, update: (empl
 function normalizeEmployees(employees: Employee[]): Employee[] {
   return employees.map((employee) => ({
     ...employee,
+    employmentStatus: employee.employmentStatus ?? 'ACTIVE',
     currentState: normalizeActorState(employee.currentState),
     activity: employee.activity ?? 'IDLE',
     movement: employee.movement ?? 'STATIONARY',
@@ -121,6 +151,8 @@ function messageFromEvent(event: DomainEvent): MessageRecord | null {
     createdAt: event.timestamp,
     readAt: undefined,
     jobId: typeof payload.jobId === 'string' ? payload.jobId : event.correlationId,
+    meetingId: typeof payload.meetingId === 'string' ? payload.meetingId : null,
+    broadcastId: typeof payload.broadcastId === 'string' ? payload.broadcastId : null,
   };
 }
 
@@ -133,6 +165,7 @@ function updateJobs(jobs: AgentJobSummary[], event: DomainEvent): AgentJobSummar
     jobType: typeof payload.jobType === 'string' ? payload.jobType : 'MESSAGE_RESPONSE',
     status: payload.status,
     employeeId: event.actorId ?? '',
+    meetingId: typeof payload.meetingId === 'string' ? payload.meetingId : null,
     attempts: typeof payload.attempts === 'number' ? payload.attempts : 0,
     createdAt: event.timestamp,
     updatedAt: event.timestamp,
@@ -195,10 +228,12 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
   loading: true,
   error: null,
   connectionStatus: 'connecting',
+  activeFloorId: null,
+  terminationPreview: null,
 
-  loadBootstrap: async () => {
+  loadBootstrap: async (floorId) => {
     try {
-      const snapshot = await fetchSnapshot();
+      const snapshot = await fetchSnapshot(floorId);
       const employees = normalizeEmployees(snapshot.employees);
       const normalizedSnapshot = {
         ...snapshot,
@@ -213,12 +248,17 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
         activeMovements: snapshot.activeMovements ?? [],
         serverTime: snapshot.serverTime ?? new Date().toISOString(),
         events: snapshot.recentEvents,
+        activeFloorId: snapshot.activeFloorId,
         loading: false,
         error: null,
       });
     } catch (error) {
       set({ loading: false, error: error instanceof Error ? error.message : 'Unable to load company snapshot' });
     }
+  },
+
+  loadFloor: async (floorId) => {
+    await get().loadBootstrap(floorId);
   },
 
   connectWebSocket: () => openCompanyWebSocket(
@@ -238,6 +278,9 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
       let activeMovements = state.activeMovements;
       let meetings = state.bootstrap?.meetings ?? [];
       let tokenUsage = state.bootstrap?.tokenUsage;
+      let floors = state.bootstrap?.floors ?? [];
+      let workstations = state.bootstrap?.workstations ?? [];
+      let hiringRequests = state.bootstrap?.hiringRequests ?? [];
 
       if (event.type === 'employee.state.changed' && event.actorId && typeof payload.to === 'string') {
         const nextState = normalizeActorState(payload.to);
@@ -376,6 +419,53 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
           });
       }
 
+      if ((event.type === 'floor.created' || event.type === 'floor.updated') && payload.floor && typeof payload.floor === 'object') {
+        const floor = payload.floor as FloorSummary;
+        floors = floors.some((item) => item.id === floor.id)
+          ? floors.map((item) => (item.id === floor.id ? floor : item))
+          : [...floors, floor].sort((left, right) => left.floorNumber - right.floorNumber);
+      }
+      if (event.type === 'floor.deleted' && typeof payload.floorId === 'string') {
+        floors = floors.filter((floor) => floor.id !== payload.floorId);
+      }
+      if (event.type === 'workstation.created' && payload.workstation && typeof payload.workstation === 'object') {
+        const workstation = payload.workstation as typeof workstations[number];
+        if (workstation.floorId === state.activeFloorId) {
+          workstations = workstations.some((item) => item.id === workstation.id)
+            ? workstations.map((item) => (item.id === workstation.id ? workstation : item))
+            : [...workstations, workstation];
+        }
+      }
+      if ((event.type === 'hiring.request.created' || event.type === 'hiring.candidates.ready') && payload.request && typeof payload.request === 'object') {
+        const request = payload.request as HiringRequestSummary;
+        hiringRequests = hiringRequests.some((item) => item.id === request.id)
+          ? hiringRequests.map((item) => (item.id === request.id ? request : item))
+          : [request, ...hiringRequests];
+      }
+      if (event.type === 'employee.hired' && payload.employee && typeof payload.employee === 'object') {
+        const hiredEmployee = normalizeEmployees([payload.employee as Employee])[0];
+        employees = employees.some((employee) => employee.id === hiredEmployee.id)
+          ? employees.map((employee) => (employee.id === hiredEmployee.id ? hiredEmployee : employee))
+          : [...employees, hiredEmployee];
+      }
+
+      const terminationEvents = new Set([
+        'EMPLOYEE_TERMINATION_STARTED',
+        'EMPLOYEE_RUNTIME_DRAINING',
+        'EMPLOYEE_PERMISSIONS_REVOKED',
+        'EMPLOYEE_LEAVING_OFFICE',
+        'EMPLOYEE_LEFT_OFFICE',
+        'EMPLOYEE_TERMINATED',
+      ]);
+      if (terminationEvents.has(event.type) && event.actorId) {
+        employees = updateEmployee(employees, event.actorId, (employee) => ({
+          ...employee,
+          employmentStatus: event.type === 'EMPLOYEE_TERMINATED' || event.type === 'EMPLOYEE_LEFT_OFFICE' ? 'TERMINATED' : 'TERMINATING',
+          status: event.type === 'EMPLOYEE_TERMINATED' || event.type === 'EMPLOYEE_LEFT_OFFICE' ? 'offline' : 'offboarding',
+          presence: event.type === 'EMPLOYEE_TERMINATED' || event.type === 'EMPLOYEE_LEFT_OFFICE' ? 'OFFLINE' : 'BUSY',
+        }));
+      }
+
       const bootstrap = state.bootstrap
         ? {
           ...state.bootstrap,
@@ -384,6 +474,9 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
           jobs,
           activeMovements,
           meetings,
+          floors,
+          workstations,
+          hiringRequests,
           tokenUsage: tokenUsage ?? state.bootstrap.tokenUsage,
           serverTime: event.timestamp,
         }
@@ -499,6 +592,22 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
     }
   },
 
+  sendMeetingMessage: async (meetingId, content) => {
+    try {
+      const response = await sendMeetingMessage(meetingId, content);
+      set((state) => {
+        const messages = mergeMessages(state.messages, response.messages);
+        return {
+          messages,
+          bootstrap: state.bootstrap ? { ...state.bootstrap, messages } : state.bootstrap,
+        };
+      });
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : 'Unable to send meeting message' });
+      throw error;
+    }
+  },
+
   markRead: async (employeeId) => {
     try {
       await markEmployeeMessagesRead(employeeId);
@@ -602,6 +711,107 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
       await get().loadBootstrap();
     } catch (error) {
       set({ error: error instanceof Error ? error.message : 'Unable to finish meeting' });
+      throw error;
+    }
+  },
+
+  createFloor: async (input) => {
+    try {
+      const floor = await createFloorApi(input);
+      await get().loadFloor(floor.id);
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : 'Unable to create floor' });
+      throw error;
+    }
+  },
+
+  updateFloor: async (floorId, input) => {
+    try {
+      await updateFloorApi(floorId, input);
+      await get().loadFloor(get().activeFloorId ?? floorId);
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : 'Unable to update floor' });
+      throw error;
+    }
+  },
+
+  deleteFloor: async (floorId) => {
+    try {
+      await deleteFloorApi(floorId);
+      const nextFloorId = get().bootstrap?.floors.find((floor) => floor.id !== floorId)?.id;
+      await get().loadBootstrap(nextFloorId);
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : 'Unable to delete floor' });
+      throw error;
+    }
+  },
+
+  createWorkstation: async (floorId) => {
+    try {
+      await createWorkstationApi(floorId);
+      await get().loadFloor(floorId);
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : 'Unable to create workstation' });
+      throw error;
+    }
+  },
+
+  hireCandidate: async (requestId, candidateId, workstationId) => {
+    try {
+      const result = await hireCandidateApi(requestId, { candidateId, workstationId });
+      await get().loadFloor(result.floorId);
+      return result;
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : 'Unable to hire candidate' });
+      throw error;
+    }
+  },
+
+  loadTerminationPreview: async (employeeId) => {
+    try {
+      const preview = await fetchTerminationPreview(employeeId);
+      set({ terminationPreview: preview });
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : 'Unable to load termination preview' });
+      throw error;
+    }
+  },
+
+  clearTerminationPreview: () => set({ terminationPreview: null }),
+
+  terminateEmployee: async (employeeId, input) => {
+    try {
+      await terminateEmployeeApi(employeeId, input);
+      set({ terminationPreview: null });
+      await get().loadBootstrap(get().activeFloorId ?? undefined);
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : 'Unable to terminate employee' });
+      throw error;
+    }
+  },
+
+  testOpenClaw: async () => {
+    try {
+      const status = await fetchOpenClawStatus();
+      set((state) => ({
+        bootstrap: state.bootstrap ? { ...state.bootstrap, openclaw: status } : state.bootstrap,
+      }));
+      return status;
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : 'Unable to test OpenClaw Gateway' });
+      throw error;
+    }
+  },
+
+  provisionEmployeeRuntime: async (employeeId) => {
+    try {
+      const employee = normalizeEmployees([await provisionEmployeeRuntimeApi(employeeId)])[0];
+      set((state) => {
+        const employees = state.employees.map((item) => (item.id === employee.id ? employee : item));
+        return { employees, bootstrap: state.bootstrap ? { ...state.bootstrap, employees } : state.bootstrap };
+      });
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : 'Unable to provision OpenClaw runtime' });
       throw error;
     }
   },

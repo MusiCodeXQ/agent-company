@@ -12,6 +12,7 @@ use crate::{
     db, events,
     models::{AgentMovementSummary, Employee, MovementPoint},
     office::{self, LocationDefinition, OfficeLayout, Rect},
+    organization,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -37,7 +38,11 @@ pub async fn request_move(
     {
         return Err(anyhow!("agent already has active movement {}", active.id));
     }
-    let layout = office::default_office();
+    let floor_id = employee.floor_id.as_deref().unwrap_or("floor-01");
+    let floor = organization::floor(&state.pool, company_id, floor_id).await?;
+    let workstation_inputs =
+        organization::workstation_layout_inputs(&state.pool, company_id, floor_id).await?;
+    let layout = office::office_for_floor(&floor.id, &floor.name, &workstation_inputs);
     let destination = layout
         .locations
         .iter()
@@ -135,10 +140,11 @@ fn transition_door<'a>(
         (Some("interview-room"), _) | (_, Some("interview-room")) => "interview_room_door",
         _ => return None,
     };
-    layout
-        .locations
-        .iter()
-        .find(|location| location.id == room_id)
+    layout.locations.iter().find(|location| {
+        location.id == room_id
+            || location.id.ends_with(&format!("__{room_id}"))
+            || location.room_id.as_deref() == Some(room_id)
+    })
 }
 
 fn astar_segment(
@@ -264,7 +270,12 @@ fn append_without_duplicate(route: &mut Vec<MovementPoint>, segment: Vec<Movemen
 }
 
 pub fn employee_workstation(employee: &Employee) -> String {
-    office::workstation_location_id(&employee.id)
+    employee
+        .desk_id
+        .as_deref()
+        .filter(|desk_id| desk_id.starts_with("workstation-"))
+        .map(str::to_string)
+        .unwrap_or_else(|| office::workstation_location_id(&employee.id))
 }
 
 #[cfg(test)]
