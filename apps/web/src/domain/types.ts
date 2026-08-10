@@ -1,5 +1,6 @@
 export type Gender = 'male' | 'female' | 'non_binary';
 
+/** Pixi 使用稳定的前端状态名；后端状态统一使用大写枚举。 */
 export type ActorState =
   | 'idle'
   | 'walking'
@@ -16,6 +17,40 @@ export type ActorState =
   | 'restroom'
   | 'error'
   | 'offline';
+
+export type AgentActivity =
+  | 'IDLE'
+  | 'THINKING'
+  | 'READING'
+  | 'CODING'
+  | 'TESTING'
+  | 'TALKING'
+  | 'MEETING'
+  | 'INTERVIEWING'
+  | 'WAITING'
+  | 'ERROR'
+  | string;
+
+export type AgentMovement = 'STATIONARY' | 'PREPARING' | 'WALKING' | 'ARRIVED' | string;
+export type AgentDevice = 'NONE' | 'PHONE' | 'COMPUTER' | string;
+export type AgentPosture = 'STANDING' | 'WALKING' | 'SITTING' | string;
+export type AgentPresence = 'AVAILABLE' | 'BUSY' | 'OFFLINE' | string;
+
+const BACKEND_STATE_MAP: Record<string, ActorState> = {
+  IDLE: 'idle',
+  WALKING: 'walking',
+  CHECK_PHONE: 'checking_phone',
+  THINKING: 'thinking',
+  WORKING: 'coding',
+  MEETING: 'meeting',
+  WAITING: 'waiting',
+  ERROR: 'error',
+};
+
+export function normalizeActorState(value: string | undefined): ActorState {
+  if (!value) return 'idle';
+  return BACKEND_STATE_MAP[value.toUpperCase()] ?? (value.toLowerCase() as ActorState);
+}
 
 export interface PersonalityProfile {
   openness: number;
@@ -56,8 +91,26 @@ export interface AgentModelConfig {
   mode: 'mock' | 'real' | string;
 }
 
+export interface TokenUsageSummary {
+  inputTokens: number;
+  outputTokens: number;
+  cacheTokens: number;
+  totalTokens: number;
+}
+
+export interface ModelProfileSummary {
+  id: string;
+  name: string;
+  protocol: string;
+  baseUrl: string;
+  apiKeyConfigured: boolean;
+  apiKeyHint?: string | null;
+  model: string;
+  enabled: boolean;
+}
+
 export interface Destination {
-  kind: 'desk' | 'room' | 'spawn';
+  kind: 'desk' | 'room' | 'spawn' | 'location';
   id: string;
 }
 
@@ -75,10 +128,24 @@ export interface Employee {
   skills: SkillProfile[];
   appearance: AppearanceProfile;
   modelConfig: AgentModelConfig;
+  modelProfileId?: string;
+  modelProfile?: ModelProfileSummary;
   deskId?: string;
   hiredAt: string;
   currentState: ActorState;
   currentDestination?: Destination;
+  activity: AgentActivity;
+  movement: AgentMovement;
+  locationId?: string | null;
+  x: number;
+  y: number;
+  roomId?: string | null;
+  device: AgentDevice;
+  posture: AgentPosture;
+  presence: AgentPresence;
+  activeMovementId?: string | null;
+  unreadCount: number;
+  tokenUsage: TokenUsageSummary;
 }
 
 export interface Company {
@@ -88,11 +155,21 @@ export interface Company {
   createdAt: string;
 }
 
+export interface GoalSummary {
+  id: string;
+  title: string;
+  description: string;
+  status: string;
+}
+
 export interface TaskSummary {
   id: string;
   title: string;
+  description: string;
+  taskType: string;
   status: string;
   assigneeId?: string;
+  goalId?: string;
 }
 
 export interface MeetingSummary {
@@ -101,7 +178,57 @@ export interface MeetingSummary {
   meetingType: string;
   roomId: string;
   participantIds: string[];
+  participants: MeetingParticipantSummary[];
   status: string;
+}
+
+export interface MeetingParticipantSummary {
+  agentId: string;
+  seatLocationId: string;
+  status: string;
+}
+
+export interface MessageRecord {
+  id: string;
+  companyId: string;
+  fromType: string;
+  fromId: string;
+  toType: string;
+  toId: string;
+  content: string;
+  createdAt: string;
+  readAt?: string | null;
+  jobId?: string | null;
+}
+
+export interface EmployeeMessageHistoryState {
+  oldestCreatedAt: string | null;
+  hasMore: boolean;
+  loading: boolean;
+}
+
+export interface AgentMemoryRecord {
+  id: string;
+  employeeId: string;
+  kind: string;
+  content: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AgentJobSummary {
+  id: string;
+  jobType: string;
+  status: string;
+  employeeId: string;
+  messageId?: string;
+  goalId?: string;
+  taskId?: string;
+  attempts: number;
+  result?: string | null;
+  error?: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface DomainEvent<TPayload = Record<string, unknown>> {
@@ -178,6 +305,39 @@ export interface Rect {
   height: number;
 }
 
+export interface LocationDefinition {
+  id: string;
+  name: string;
+  type: string;
+  roomId?: string | null;
+  x: number;
+  y: number;
+}
+
+export interface MovementConfig {
+  baseSpeed: number;
+  gridCellSize: number;
+}
+
+export interface MovementPoint {
+  x: number;
+  y: number;
+}
+
+export interface ActiveMovement {
+  id: string;
+  companyId: string;
+  agentId: string;
+  fromLocationId: string;
+  toLocationId: string;
+  path: MovementPoint[];
+  startedAt: string;
+  estimatedArrivalAt: string;
+  movementStatus: 'PENDING' | 'MOVING' | 'ARRIVED' | 'CANCELLED' | 'FAILED' | string;
+  createdAt: string;
+  completedAt?: string | null;
+}
+
 export interface OfficeLayout {
   width: number;
   height: number;
@@ -188,25 +348,43 @@ export interface OfficeLayout {
   doors: DoorDefinition[];
   spawnPoints: SpawnPoint[];
   navigationObstacles: Rect[];
+  locations: LocationDefinition[];
+  movement: MovementConfig;
 }
 
-export interface BootstrapResponse {
+export interface CompanySnapshot {
   company: Company;
   employees: Employee[];
+  goals: GoalSummary[];
   tasks: TaskSummary[];
   meetings: MeetingSummary[];
   hiringRequests: unknown[];
+  messages: MessageRecord[];
+  unreadCounts: Record<string, number>;
+  jobs: AgentJobSummary[];
+  modelProfiles: ModelProfileSummary[];
   office: OfficeLayout;
+  officeState: Array<{ employeeId: string; currentState: string; destination?: Destination | null }>;
+  activeMovements: ActiveMovement[];
+  tokenUsage: TokenUsageSummary;
+  serverTime: string;
   recentEvents: DomainEvent[];
 }
 
+export type BootstrapResponse = CompanySnapshot;
+
 export interface CompanyStoreState {
-  bootstrap: BootstrapResponse | null;
+  bootstrap: CompanySnapshot | null;
   employees: Employee[];
   events: DomainEvent[];
+  messages: MessageRecord[];
+  messageHistory: Record<string, EmployeeMessageHistoryState>;
+  activeMovements: ActiveMovement[];
+  serverTime: string | null;
+  memories: Record<string, AgentMemoryRecord[]>;
   selectedEmployeeId: string | null;
+  phoneEmployeeId: string | null;
   loading: boolean;
   error: string | null;
   connectionStatus: 'connecting' | 'connected' | 'disconnected';
 }
-

@@ -1,21 +1,14 @@
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::StreamExt;
-use serde::Deserialize;
 use tokio::select;
 
-use crate::{app_state::AppState, demo, models::DomainEvent};
-
-#[derive(Debug, Deserialize)]
-struct ClientCommand {
-    #[serde(rename = "type")]
-    command_type: String,
-}
+use crate::{app_state::AppState, models::DomainEvent};
 
 pub async fn handle_socket(mut socket: WebSocket, state: AppState, company_id: String) {
     let ready = serde_json::json!({
         "type": "connection.ready",
         "companyId": company_id,
-        "mode": "mock"
+        "mode": "persistent-agent-runtime"
     });
     if socket
         .send(Message::Text(ready.to_string().into()))
@@ -41,13 +34,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, company_id: S
             }
             message = socket.next() => {
                 match message {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Ok(command) = serde_json::from_str::<ClientCommand>(&text) {
-                            if command.command_type == "demo.start" {
-                                let _ = demo::start(state.clone(), company_id.clone()).await;
-                            }
-                        }
-                    }
+                    Some(Ok(Message::Text(_))) => {}
                     Some(Ok(Message::Ping(payload))) => {
                         if socket.send(Message::Pong(payload)).await.is_err() {
                             break;

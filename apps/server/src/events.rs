@@ -95,8 +95,16 @@ pub async fn transition(
     .bind(company_id)
     .fetch_one(&state.pool)
     .await?;
-    sqlx::query("UPDATE employees SET current_state = ? WHERE id = ? AND company_id = ?")
+    let (activity, device) = state_dimensions(to);
+    sqlx::query(
+        "UPDATE employees
+         SET current_state = ?, activity = ?, device = ?,
+             posture = CASE WHEN movement IN ('PREPARING', 'WALKING') THEN 'WALKING' ELSE 'SITTING' END
+         WHERE id = ? AND company_id = ?",
+    )
         .bind(to)
+        .bind(activity)
+        .bind(device)
         .bind(employee_id)
         .bind(company_id)
         .execute(&state.pool)
@@ -110,6 +118,18 @@ pub async fn transition(
         json!({ "from": from, "to": to, "taskId": task_id }),
     )
     .await
+}
+
+fn state_dimensions(state: &str) -> (&'static str, &'static str) {
+    match state {
+        "CHECK_PHONE" => ("READING", "PHONE"),
+        "THINKING" => ("THINKING", "NONE"),
+        "WORKING" => ("CODING", "COMPUTER"),
+        "MEETING" => ("MEETING", "NONE"),
+        "WAITING" => ("WAITING", "NONE"),
+        "ERROR" => ("ERROR", "NONE"),
+        _ => ("IDLE", "NONE"),
+    }
 }
 
 fn event_from_row(row: EventRow) -> DomainEvent {

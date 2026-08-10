@@ -1,7 +1,7 @@
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::Arc;
 
 use sqlx::SqlitePool;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 
 use crate::models::DomainEvent;
 
@@ -9,7 +9,7 @@ use crate::models::DomainEvent;
 pub struct AppState {
     pub pool: SqlitePool,
     pub event_tx: broadcast::Sender<DomainEvent>,
-    pub demo_running: Arc<AtomicBool>,
+    pub worker_notify: Arc<Notify>,
 }
 
 impl AppState {
@@ -18,7 +18,7 @@ impl AppState {
         Self {
             pool,
             event_tx,
-            demo_running: Arc::new(AtomicBool::new(false)),
+            worker_notify: Arc::new(Notify::new()),
         }
     }
 }

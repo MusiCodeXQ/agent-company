@@ -24,7 +24,7 @@ export function OfficeCanvas(): ReactElement {
         await app.init({
           width: Math.max(container.clientWidth, 1),
           height: Math.max(container.clientHeight, 1),
-          background: '#111821',
+          background: '#0b1114',
           antialias: true,
           autoDensity: true,
           resolution: Math.min(window.devicePixelRatio || 1, 2),
@@ -36,7 +36,9 @@ export function OfficeCanvas(): ReactElement {
         }
 
         container.appendChild(app.canvas);
-        engine = new OfficeEngine(app, (employeeId) => useCompanyStore.getState().selectEmployee(employeeId));
+        engine = new OfficeEngine(app, (employeeId) => {
+          void useCompanyStore.getState().openPhone(employeeId);
+        });
         engineRef.current = engine;
 
         const resize = (): void => {
@@ -51,11 +53,13 @@ export function OfficeCanvas(): ReactElement {
         const state = useCompanyStore.getState();
         engine.setOffice(state.bootstrap?.office ?? defaultOffice);
         engine.setEmployees(state.employees);
+        engine.setMovements(state.activeMovements, state.serverTime);
         engine.setSelectedEmployee(state.selectedEmployeeId);
 
         unsubscribe = useCompanyStore.subscribe((nextState) => {
           engine?.setOffice(nextState.bootstrap?.office ?? defaultOffice);
           engine?.setEmployees(nextState.employees);
+          engine?.setMovements(nextState.activeMovements, nextState.serverTime);
           engine?.setSelectedEmployee(nextState.selectedEmployeeId);
         });
       } catch (error) {
