@@ -1,0 +1,60 @@
+import type { OfficeLayout } from '../../domain/types';
+
+export const defaultOffice: OfficeLayout = {
+  width: 1600,
+  height: 900,
+  rooms: [
+    { id: 'open-office', type: 'workspace', label: '开放办公区', x: 260, y: 120, width: 850, height: 580 },
+    { id: 'meeting-a', type: 'meeting', label: '协作会议室', x: 1130, y: 120, width: 390, height: 250 },
+    { id: 'interview-room', type: 'interview', label: '面试室', x: 1130, y: 390, width: 390, height: 210 },
+    { id: 'hr-office', type: 'office', label: 'HR 办公室', x: 40, y: 120, width: 190, height: 260 },
+    { id: 'reception', type: 'reception', label: '前台接待', x: 40, y: 410, width: 190, height: 180 },
+    { id: 'pantry', type: 'pantry', label: '茶水间', x: 1130, y: 620, width: 220, height: 200 },
+    { id: 'restroom', type: 'restroom', label: '卫生间', x: 1370, y: 620, width: 150, height: 200 },
+  ],
+  furniture: [
+    { id: 'meeting-table', kind: 'meeting-table', x: 1190, y: 205, width: 270, height: 76 },
+    { id: 'interview-table', kind: 'interview-table', x: 1180, y: 455, width: 230, height: 64 },
+    { id: 'hr-cabinet', kind: 'cabinet', x: 65, y: 145, width: 130, height: 34, label: '人才档案' },
+    { id: 'reception-counter', kind: 'reception-counter', x: 58, y: 500, width: 150, height: 38, label: 'VISITOR' },
+    { id: 'pantry-counter', kind: 'pantry-counter', x: 1160, y: 700, width: 160, height: 40, label: 'COFFEE' },
+    { id: 'coffee-machine', kind: 'coffee-machine', x: 1175, y: 655, width: 46, height: 38 },
+    { id: 'water-dispenser', kind: 'water-dispenser', x: 1260, y: 655, width: 38, height: 38 },
+    { id: 'restroom-sinks', kind: 'restroom-sinks', x: 1390, y: 660, width: 105, height: 38 },
+  ],
+  desks: [
+    { id: 'desk-supervisor-01', employeeId: 'supervisor-01', x: 310, y: 180, width: 160, height: 82, seatId: 'seat-supervisor-01', monitorX: 368, monitorY: 194 },
+    { id: 'desk-product-01', employeeId: 'product-01', x: 515, y: 180, width: 160, height: 82, seatId: 'seat-product-01', monitorX: 573, monitorY: 194 },
+    { id: 'desk-ui-01', employeeId: 'ui-01', x: 720, y: 180, width: 160, height: 82, seatId: 'seat-ui-01', monitorX: 778, monitorY: 194 },
+    { id: 'desk-frontend-01', employeeId: 'frontend-01', x: 925, y: 180, width: 160, height: 82, seatId: 'seat-frontend-01', monitorX: 983, monitorY: 194 },
+    { id: 'desk-backend-01', employeeId: 'backend-01', x: 410, y: 450, width: 160, height: 82, seatId: 'seat-backend-01', monitorX: 468, monitorY: 464 },
+    { id: 'desk-qa-01', employeeId: 'qa-01', x: 650, y: 450, width: 160, height: 82, seatId: 'seat-qa-01', monitorX: 708, monitorY: 464 },
+    { id: 'desk-hr-01', employeeId: 'hr-01', x: 70, y: 210, width: 160, height: 82, seatId: 'seat-hr-01', monitorX: 128, monitorY: 224 },
+  ],
+  seats: [
+    { id: 'seat-supervisor-01', kind: 'desk', x: 390, y: 288, roomId: 'open-office', employeeId: 'supervisor-01', deskId: 'desk-supervisor-01' },
+    { id: 'seat-product-01', kind: 'desk', x: 595, y: 288, roomId: 'open-office', employeeId: 'product-01', deskId: 'desk-product-01' },
+    { id: 'seat-ui-01', kind: 'desk', x: 800, y: 288, roomId: 'open-office', employeeId: 'ui-01', deskId: 'desk-ui-01' },
+    { id: 'seat-frontend-01', kind: 'desk', x: 1005, y: 288, roomId: 'open-office', employeeId: 'frontend-01', deskId: 'desk-frontend-01' },
+    { id: 'seat-backend-01', kind: 'desk', x: 490, y: 558, roomId: 'open-office', employeeId: 'backend-01', deskId: 'desk-backend-01' },
+    { id: 'seat-qa-01', kind: 'desk', x: 730, y: 558, roomId: 'open-office', employeeId: 'qa-01', deskId: 'desk-qa-01' },
+    { id: 'seat-hr-01', kind: 'desk', x: 150, y: 318, roomId: 'hr-office', employeeId: 'hr-01', deskId: 'desk-hr-01' },
+    { id: 'meeting-seat-backend', kind: 'meeting', x: 1280, y: 245, roomId: 'meeting-a', employeeId: 'backend-01' },
+    { id: 'meeting-seat-2', kind: 'meeting', x: 1350, y: 245, roomId: 'meeting-a' },
+    { id: 'interview-seat-1', kind: 'interview', x: 1230, y: 505, roomId: 'interview-room' },
+  ],
+  doors: [
+    { id: 'door-open-office', roomId: 'open-office', x: 1100, y: 340, width: 30, height: 70 },
+    { id: 'door-meeting', roomId: 'meeting-a', x: 1120, y: 220, width: 25, height: 54 },
+    { id: 'door-interview', roomId: 'interview-room', x: 1120, y: 455, width: 25, height: 54 },
+    { id: 'door-reception', roomId: 'reception', x: 220, y: 480, width: 25, height: 54 },
+    { id: 'door-pantry', roomId: 'pantry', x: 1120, y: 680, width: 25, height: 54 },
+    { id: 'door-restroom', roomId: 'restroom', x: 1355, y: 680, width: 25, height: 54 },
+  ],
+  spawnPoints: [{ id: 'visitor-entry', x: 85, y: 640 }],
+  navigationObstacles: [
+    { x: 1190, y: 205, width: 270, height: 76 },
+    { x: 1180, y: 455, width: 230, height: 64 },
+  ],
+};
+

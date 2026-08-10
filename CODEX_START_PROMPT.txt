@@ -1,0 +1,13 @@
+请先完整阅读 AGENTS.md 和 docs/AI_COMPANY_PRODUCT_SPEC.md，然后直接开始实施。
+
+本轮只做产品规格中的 Phase 1 + Phase 2 + 最小 Phase 3，不要接真实 LLM，不要做 Shell coding agent，不要引入 Redis/Kafka/Kubernetes。
+
+要求你实际创建代码并运行构建/测试，不要只给方案。遇到小的未定义细节自行选择简单可维护实现继续推进。
+
+完成后汇报：
+1. 已实现功能；
+2. 关键目录结构；
+3. 启动命令；
+4. 测试/构建结果；
+5. 仍未实现的内容；
+6. 下一轮开始招聘/面试 Mock 流程前需要注意的问题。
