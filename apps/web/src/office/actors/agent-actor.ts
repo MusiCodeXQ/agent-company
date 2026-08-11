@@ -94,13 +94,21 @@ export class AgentActor extends Container {
   private travelDirection: TravelDirection = 'front';
   private readonly animation = new AgentAnimationController();
   private readonly onSelect: (employeeId: string) => void;
+  private readonly onOpenPhone: (employeeId: string) => void;
+  private lastTapAt = 0;
 
-  constructor(employee: Employee, office: OfficeLayout, onSelect: (employeeId: string) => void) {
+  constructor(
+    employee: Employee,
+    office: OfficeLayout,
+    onSelect: (employeeId: string) => void,
+    onOpenPhone: (employeeId: string) => void,
+  ) {
     super();
     this.employee = employee;
     this.office = office;
     this.state = employee.currentState;
     this.onSelect = onSelect;
+    this.onOpenPhone = onOpenPhone;
     this.logicalPosition = initialPosition(employee, office);
     this.facing = employee.appearance.seed % 2 === 0 ? 1 : -1;
     this.eventMode = 'static';
@@ -157,7 +165,16 @@ export class AgentActor extends Container {
       phone: this.phone,
     };
 
-    this.on('pointertap', () => this.onSelect(this.employee.id));
+    this.on('pointertap', () => {
+      const now = performance.now();
+      this.onSelect(this.employee.id);
+      if (now - this.lastTapAt <= 320) {
+        this.onOpenPhone(this.employee.id);
+        this.lastTapAt = 0;
+      } else {
+        this.lastTapAt = now;
+      }
+    });
     this.redrawAppearance();
     this.setLogicalPosition(this.logicalPosition);
     this.refreshVisuals();

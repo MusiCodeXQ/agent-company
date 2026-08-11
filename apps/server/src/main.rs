@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or_else(|_| "sqlite://data/ai_company.db?mode=rwc".to_string());
     ensure_database_directory(&database_url)?;
     let pool = db::initialize(&database_url).await?;
-    organization::ensure_floor_administrators(&pool).await?;
+    organization::ensure_company_administrator(&pool).await?;
     let state = AppState::new(pool);
     if state.container_engine.config().enabled {
         match state.container_engine.cleanup_stale_containers().await {

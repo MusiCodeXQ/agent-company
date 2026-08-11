@@ -283,24 +283,24 @@ pub async fn create_floor(
         .execute(&mut *tx)
         .await?;
     }
-    insert_default_floor_roles(&mut tx, company_id, &floor_id, &now).await?;
-    let administrator_id =
-        insert_floor_administrator(&mut tx, company_id, &floor_id, floor_number, &name, &now)
-            .await?;
     tx.commit().await?;
-    crate::db::ensure_employee_runtime_binding(pool, company_id, &administrator_id).await?;
     floor(pool, company_id, &floor_id).await
 }
 
-pub async fn ensure_floor_administrators(pool: &SqlitePool) -> Result<()> {
+pub async fn ensure_company_administrator(pool: &SqlitePool) -> Result<()> {
     let rows = sqlx::query(
-        "SELECT f.company_id, f.id, f.floor_number, f.name
-         FROM floors f
-         WHERE f.status = 'ACTIVE' AND NOT EXISTS (
+        "SELECT c.id AS company_id, f.id, f.floor_number, f.name
+         FROM companies c
+         JOIN floors f ON f.id = (
+           SELECT first_floor.id FROM floors first_floor
+           WHERE first_floor.company_id = c.id AND first_floor.status = 'ACTIVE'
+           ORDER BY first_floor.floor_number, first_floor.id LIMIT 1
+         )
+         WHERE NOT EXISTS (
            SELECT 1 FROM employees e
-           WHERE e.company_id = f.company_id AND e.floor_id = f.id
+           WHERE e.company_id = c.id
              AND e.is_floor_administrator = 1 AND e.employment_status = 'ACTIVE'
-         ) ORDER BY f.company_id, f.floor_number",
+         ) ORDER BY c.id",
     )
     .fetch_all(pool)
     .await?;
@@ -1019,15 +1019,15 @@ pub fn hiring_intent(content: &str) -> bool {
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect::<String>();
-    (normalized.contains('招')
-        || normalized.contains("招聘")
-        || normalized.contains('找')
-        || normalized.contains("需要")
-        || normalized.contains("要"))
-        && (normalized.contains('人')
-            || normalized.contains("岗位")
-            || normalized.contains("员工")
-            || normalized.contains("职位"))
+    normalized.contains("招聘")
+        || (normalized.contains('招')
+            || normalized.contains('找')
+            || normalized.contains("需要")
+            || normalized.contains("要"))
+            && (normalized.contains('人')
+                || normalized.contains("岗位")
+                || normalized.contains("员工")
+                || normalized.contains("职位"))
 }
 
 pub fn candidate_refresh_intent(content: &str) -> bool {
@@ -1316,43 +1316,6 @@ async fn find_or_create_role(
     .execute(&mut **tx)
     .await?;
     Ok(id)
-}
-
-async fn insert_default_floor_roles(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    company_id: &str,
-    floor_id: &str,
-    now: &str,
-) -> Result<()> {
-    let defaults = [(
-        "管理员",
-        vec![
-            "招聘与解雇",
-            "楼层人员与工位管理",
-            "巡查任务与Token消耗",
-            "识别并解除停滞任务",
-        ],
-        vec!["组织管理", "人才评估", "运行巡查", "任务干预"],
-    )];
-    for (name, responsibilities, skills) in defaults {
-        sqlx::query(
-            "INSERT INTO role_definitions
-             (id, company_id, floor_id, name, responsibilities, skills, preferences,
-              created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, '[]', ?, ?)",
-        )
-        .bind(format!("role-{}", Uuid::new_v4()))
-        .bind(company_id)
-        .bind(floor_id)
-        .bind(name)
-        .bind(serde_json::to_string(&responsibilities)?)
-        .bind(serde_json::to_string(&skills)?)
-        .bind(now)
-        .bind(now)
-        .execute(&mut **tx)
-        .await?;
-    }
-    Ok(())
 }
 
 async fn insert_floor_administrator(
@@ -1724,6 +1687,8 @@ mod tests {
     fn detects_hiring_intent_and_counts_chinese_numbers() {
         assert!(hiring_intent("帮我找三个懂研究的人"));
         assert!(hiring_intent("需要两个懂研究的人"));
+        assert!(hiring_intent("招聘一个UI/UX设计"));
+        assert_eq!(derive_title("招聘一个UI/UX设计"), "UI/UX设计");
         assert_eq!(extract_count("两个岗位"), 2);
         assert_eq!(derive_title("再要一个做文章审核的人"), "做文章审核");
         assert!(!extract_terms("AI研究").is_empty());

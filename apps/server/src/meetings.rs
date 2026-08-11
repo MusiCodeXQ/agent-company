@@ -285,7 +285,8 @@ pub async fn finish(
             .into_iter()
             .find(|employee| employee.id == employee_id)
             .ok_or_else(|| anyhow!("employee {employee_id} was not found"))?;
-        let workstation = spatial::employee_workstation(&employee);
+        let workstation =
+            spatial::employee_workstation_location(state, company_id, &employee).await?;
         if employee.location_id.as_deref() != Some(workstation.as_str()) {
             spatial::request_move(
                 state,

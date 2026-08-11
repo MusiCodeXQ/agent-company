@@ -269,13 +269,24 @@ fn append_without_duplicate(route: &mut Vec<MovementPoint>, segment: Vec<Movemen
     }
 }
 
-pub fn employee_workstation(employee: &Employee) -> String {
-    employee
-        .desk_id
-        .as_deref()
-        .filter(|desk_id| desk_id.starts_with("workstation-"))
-        .map(str::to_string)
-        .unwrap_or_else(|| office::workstation_location_id(&employee.id))
+pub async fn employee_workstation_location(
+    state: &AppState,
+    company_id: &str,
+    employee: &Employee,
+) -> Result<String> {
+    if let Some(desk_id) = employee.desk_id.as_deref() {
+        if let Some(location_id) = sqlx::query_scalar::<_, String>(
+            "SELECT location_id FROM workstations WHERE company_id = ? AND id = ?",
+        )
+        .bind(company_id)
+        .bind(desk_id)
+        .fetch_optional(&state.pool)
+        .await?
+        {
+            return Ok(location_id);
+        }
+    }
+    Ok(office::workstation_location_id(&employee.id))
 }
 
 #[cfg(test)]

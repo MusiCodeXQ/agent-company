@@ -27,14 +27,19 @@ async fn worker_loop(state: AppState) -> Result<()> {
             Ok(Some(job)) => {
                 if let Err(error) = process_job(&state, job.clone()).await {
                     tracing::error!(job_id = %job.id, %error, "agent job failed unexpectedly");
-                    let _ = db::finish_job(
-                        &state.pool,
-                        &job.id,
-                        "FAILED",
-                        None,
-                        Some(&error.to_string()),
+                    let error_text = format!("{error:#}");
+                    let _ = db::finish_job(&state.pool, &job.id, "FAILED", None, Some(&error_text))
+                        .await;
+                    let _ = events::transition(
+                        &state,
+                        &job.company_id,
+                        &job.employee_id,
+                        "ERROR",
+                        job.task_id.as_deref(),
+                        Some(&job.id),
                     )
                     .await;
+                    let _ = emit_job_state(&state, &job, "FAILED").await;
                 }
                 continue;
             }
@@ -230,6 +235,12 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
             tracing::warn!(%error, job_id = %job.id, "administrator model candidate generation failed; keeping local fallback candidates");
         }
     }
+    let requires_workstation = !command_mode
+        && !meeting_job
+        && existing_message.is_none()
+        && termination_reply.is_none()
+        && patrol_result.is_none()
+        && hiring_request.is_none();
     let message = if let Some(message) = existing_message {
         message
     } else {
@@ -353,13 +364,14 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
     {
         tracing::warn!(%error, employee_id = %job.employee_id, "unable to persist agent memory");
     }
-    if !command_mode && !meeting_job {
+    if requires_workstation {
         let employee = db::employees(&state.pool, &job.company_id)
             .await?
             .into_iter()
             .find(|employee| employee.id == job.employee_id)
             .ok_or_else(|| anyhow!("employee {} was not found", job.employee_id))?;
-        let workstation = spatial::employee_workstation(&employee);
+        let workstation =
+            spatial::employee_workstation_location(state, &job.company_id, &employee).await?;
         if employee.location_id.as_deref() != Some(workstation.as_str()) {
             spatial::request_move(
                 state,

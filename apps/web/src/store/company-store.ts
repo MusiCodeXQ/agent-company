@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import {
   createFloor as createFloorApi,
+  cancelEmployeeTermination as cancelEmployeeTerminationApi,
   createModelProfile,
   createWorkstation as createWorkstationApi,
   bindEmployeeModelProfile,
@@ -82,6 +83,7 @@ interface CompanyStoreActions {
   loadTerminationPreview: (employeeId: string) => Promise<void>;
   clearTerminationPreview: () => void;
   terminateEmployee: (employeeId: string, input: TerminationInput) => Promise<void>;
+  cancelEmployeeTermination: (employeeId: string) => Promise<void>;
   testOpenClaw: () => Promise<OpenClawStatus>;
   provisionEmployeeRuntime: (employeeId: string) => Promise<void>;
   provisionEmployeeWorkspace: (employeeId: string) => Promise<void>;
@@ -493,6 +495,17 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
           presence: event.type === 'EMPLOYEE_TERMINATED' || event.type === 'EMPLOYEE_LEFT_OFFICE' ? 'OFFLINE' : 'BUSY',
         }));
       }
+      if (event.type === 'EMPLOYEE_TERMINATION_CANCELLED' && event.actorId) {
+        employees = updateEmployee(employees, event.actorId, (employee) => ({
+          ...employee,
+          employmentStatus: 'ACTIVE',
+          status: 'online',
+          presence: 'AVAILABLE',
+          currentState: 'idle',
+          activity: 'IDLE',
+          movement: 'STATIONARY',
+        }));
+      }
 
       const bootstrap = state.bootstrap
         ? {
@@ -831,6 +844,16 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
       await get().loadBootstrap(get().activeFloorId ?? undefined);
     } catch (error) {
       set({ error: error instanceof Error ? error.message : 'Unable to terminate employee' });
+      throw error;
+    }
+  },
+
+  cancelEmployeeTermination: async (employeeId) => {
+    try {
+      await cancelEmployeeTerminationApi(employeeId);
+      await get().loadBootstrap(get().activeFloorId ?? undefined);
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : 'Unable to cancel termination' });
       throw error;
     }
   },

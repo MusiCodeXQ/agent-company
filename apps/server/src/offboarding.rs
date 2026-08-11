@@ -9,7 +9,7 @@ use crate::{
     container_runtime, db,
     db::MovementArrival,
     events,
-    models::{TerminationPreview, TerminationRecordSummary, TerminationTaskSummary},
+    models::{Employee, TerminationPreview, TerminationRecordSummary, TerminationTaskSummary},
     office, openclaw, spatial,
 };
 
@@ -680,6 +680,108 @@ pub async fn finalize(
     )
     .await?;
     Ok(())
+}
+
+pub async fn cancel(state: &AppState, company_id: &str, employee_id: &str) -> Result<Employee> {
+    let employee = db::employees(&state.pool, company_id)
+        .await?
+        .into_iter()
+        .find(|employee| employee.id == employee_id)
+        .ok_or_else(|| anyhow!("employee was not found: {employee_id}"))?;
+    if employee.employment_status != "TERMINATING" {
+        return Err(anyhow!("only an unfinished termination can be cancelled"));
+    }
+    let termination_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM termination_records
+         WHERE company_id = ? AND employee_id = ? AND status = 'TERMINATING'
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(employee_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| anyhow!("active termination record was not found"))?;
+    let now = Utc::now().to_rfc3339();
+    let workstation_location = if let Some(desk_id) = employee.desk_id.as_deref() {
+        sqlx::query_scalar::<_, String>(
+            "SELECT location_id FROM workstations WHERE company_id = ? AND id = ?",
+        )
+        .bind(company_id)
+        .bind(desk_id)
+        .fetch_optional(&state.pool)
+        .await?
+    } else {
+        None
+    };
+    let posture = if employee.location_id == workstation_location {
+        "SITTING"
+    } else {
+        "STANDING"
+    };
+    let mut tx = state.pool.begin().await?;
+    sqlx::query(
+        "UPDATE agent_movements SET movement_status = 'CANCELLED', completed_at = ?
+         WHERE company_id = ? AND agent_id = ? AND movement_status IN ('PENDING', 'MOVING')",
+    )
+    .bind(&now)
+    .bind(company_id)
+    .bind(employee_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM location_reservations WHERE company_id = ? AND agent_id = ?")
+        .bind(company_id)
+        .bind(employee_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE employees SET employment_status = 'ACTIVE', status = 'online',
+         current_state = 'IDLE', activity = 'IDLE', movement = 'STATIONARY',
+         device = 'NONE', posture = ?, presence = 'AVAILABLE',
+         active_movement_id = NULL, current_destination = NULL
+         WHERE company_id = ? AND id = ? AND employment_status = 'TERMINATING'",
+    )
+    .bind(posture)
+    .bind(company_id)
+    .bind(employee_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE termination_records SET status = 'CANCELLED',
+         runtime_shutdown_status = 'RESTORED', workstation_release_status = 'RETAINED',
+         completed_at = ? WHERE id = ? AND company_id = ?",
+    )
+    .bind(&now)
+    .bind(&termination_id)
+    .bind(company_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE employee_runtime_bindings
+         SET provision_status = CASE WHEN runtime_type = 'MOCK' THEN 'READY' ELSE provision_status END,
+             runtime_status = CASE WHEN runtime_type = 'MOCK' THEN 'ACTIVE' ELSE runtime_status END,
+             last_error = NULL, updated_at = ?
+         WHERE company_id = ? AND employee_id = ?",
+    )
+    .bind(&now)
+    .bind(company_id)
+    .bind(employee_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    events::emit(
+        state,
+        company_id,
+        "EMPLOYEE_TERMINATION_CANCELLED",
+        Some(employee_id),
+        Some(&termination_id),
+        json!({ "employeeId": employee_id, "terminationId": termination_id }),
+    )
+    .await?;
+    db::employees(&state.pool, company_id)
+        .await?
+        .into_iter()
+        .find(|employee| employee.id == employee_id)
+        .ok_or_else(|| anyhow!("employee disappeared after termination cancellation"))
 }
 
 fn record_from_row(row: sqlx::sqlite::SqliteRow) -> Result<TerminationRecordSummary, sqlx::Error> {

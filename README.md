@@ -51,7 +51,7 @@ Agent Company is designed as a visual multi-agent operating system and debugger:
 ### Employees, Floors, and Administrators
 
 - Employee identity, personality, skills, appearance seed, workstation, model binding, and runtime state are persisted in SQLite.
-- Every newly created floor receives a real administrator employee, an administrator office, and a dedicated workstation.
+- Each company keeps one authoritative administrator who manages hiring, offboarding, and runtime patrols across all floors.
 - Administrators handle hiring, offboarding, floor management, and runtime patrols.
 - An administrator can inspect employee token usage and active jobs on their floor, and identify jobs with excessive retries or long periods without updates.
 - With an explicit intervention command, an administrator can cancel suspected dead-loop jobs before they consume more tokens.

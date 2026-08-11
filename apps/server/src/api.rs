@@ -78,6 +78,10 @@ pub fn router(state: AppState) -> Router {
             post(terminate_employee),
         )
         .route(
+            "/api/companies/{company_id}/employees/{employee_id}/termination/cancel",
+            post(cancel_employee_termination),
+        )
+        .route(
             "/api/companies/{company_id}/employees/{employee_id}/runtime/provision",
             post(provision_employee_runtime),
         )
@@ -322,6 +326,16 @@ async fn terminate_employee(
     .await
     .map_err(ApiError::from_anyhow)?;
     Ok(Json(record))
+}
+
+async fn cancel_employee_termination(
+    State(state): State<AppState>,
+    Path((company_id, employee_id)): Path<(String, String)>,
+) -> Result<Json<crate::models::Employee>, ApiError> {
+    let employee = offboarding::cancel(&state, &company_id, &employee_id)
+        .await
+        .map_err(ApiError::from_anyhow)?;
+    Ok(Json(employee))
 }
 
 async fn provision_employee_runtime(

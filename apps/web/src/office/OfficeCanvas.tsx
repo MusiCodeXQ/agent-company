@@ -39,6 +39,9 @@ export function OfficeCanvas({ onMeetingTableClick }: { onMeetingTableClick?: ()
         engine = new OfficeEngine(
           app,
           (employeeId) => {
+            useCompanyStore.getState().selectEmployee(employeeId);
+          },
+          (employeeId) => {
             void useCompanyStore.getState().openPhone(employeeId);
           },
           () => onMeetingTableClick?.(),

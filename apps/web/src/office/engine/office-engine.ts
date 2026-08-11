@@ -76,6 +76,7 @@ export class OfficeEngine {
   private lastPointer = { x: 0, y: 0 };
   private cameraTarget: CameraPoint | null = null;
   private readonly onSelect: (employeeId: string) => void;
+  private readonly onOpenPhone: (employeeId: string) => void;
   private readonly onMeetingTableClick: () => void;
   private readonly onWheel: (event: WheelEvent) => void;
   private readonly onPointerDown: (event: PointerEvent) => void;
@@ -86,10 +87,12 @@ export class OfficeEngine {
   constructor(
     app: Application,
     onSelect: (employeeId: string) => void,
+    onOpenPhone: (employeeId: string) => void,
     onMeetingTableClick: () => void = () => undefined,
   ) {
     this.app = app;
     this.onSelect = onSelect;
+    this.onOpenPhone = onOpenPhone;
     this.onMeetingTableClick = onMeetingTableClick;
     this.depthLayer.sortableChildren = true;
     this.world.addChild(
@@ -149,7 +152,7 @@ export class OfficeEngine {
           this.serverTime,
         );
       } else {
-        const actor = new AgentActor(employee, this.office, this.onSelect);
+        const actor = new AgentActor(employee, this.office, this.onSelect, this.onOpenPhone);
         actor.syncEmployee(
           employee,
           this.office,

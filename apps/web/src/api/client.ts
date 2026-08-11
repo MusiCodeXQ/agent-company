@@ -228,6 +228,12 @@ export async function terminateEmployee(employeeId: string, input: TerminationIn
   return response.json() as Promise<TerminationRecordSummary>;
 }
 
+export async function cancelEmployeeTermination(employeeId: string): Promise<Employee> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/employees/${encodeURIComponent(employeeId)}/termination/cancel`, { method: 'POST' });
+  if (!response.ok) throw await readError(response, 'Termination cancellation failed');
+  return response.json() as Promise<Employee>;
+}
+
 export async function provisionEmployeeRuntime(employeeId: string): Promise<Employee> {
   const response = await fetch(`/api/companies/${COMPANY_ID}/employees/${encodeURIComponent(employeeId)}/runtime/provision`, { method: 'POST' });
   if (!response.ok) throw await readError(response, 'OpenClaw runtime provisioning failed');

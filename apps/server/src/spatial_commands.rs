@@ -129,7 +129,8 @@ pub async fn execute(
         }
         SpatialCommand::MoveToWorkstation => {
             let employee = employee(state, company_id, actor_id).await?;
-            let workstation = spatial::employee_workstation(&employee);
+            let workstation =
+                spatial::employee_workstation_location(state, company_id, &employee).await?;
             if employee.location_id.as_deref() == Some(workstation.as_str())
                 && employee.active_movement_id.is_none()
             {
@@ -345,13 +346,14 @@ async fn supervisor_notification_round(
         .iter()
         .find(|employee| employee.id == supervisor_id)
         .ok_or_else(|| anyhow!("supervisor/actor {supervisor_id} was not found"))?;
-    let supervisor_workstation = spatial::employee_workstation(supervisor);
+    let supervisor_workstation =
+        spatial::employee_workstation_location(state, company_id, supervisor).await?;
 
     for recipient in employees
         .iter()
         .filter(|employee| employee.id != supervisor_id)
     {
-        let target = spatial::employee_workstation(recipient);
+        let target = spatial::employee_workstation_location(state, company_id, recipient).await?;
         if let Some(movement) = move_if_needed(
             state,
             company_id,
@@ -382,15 +384,16 @@ async fn supervisor_notification_round(
         .await?;
 
         let current_recipient = employee(state, company_id, &recipient.id).await?;
-        if current_recipient.location_id.as_deref()
-            != Some(spatial::employee_workstation(&current_recipient).as_str())
+        let recipient_workstation =
+            spatial::employee_workstation_location(state, company_id, &current_recipient).await?;
+        if current_recipient.location_id.as_deref() != Some(recipient_workstation.as_str())
             && current_recipient.active_movement_id.is_none()
         {
             let _ = spatial::request_move(
                 state,
                 company_id,
                 &recipient.id,
-                &spatial::employee_workstation(&current_recipient),
+                &recipient_workstation,
                 "SUPERVISOR_RETURN_TO_OFFICE",
             )
             .await;
