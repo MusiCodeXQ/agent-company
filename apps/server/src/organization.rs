@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
+use serde::Deserialize;
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
@@ -26,6 +27,132 @@ pub struct HireDraft {
     pub floor_id: String,
     pub workstation_id: String,
     pub location_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AdministratorPatrolResult {
+    pub reply: String,
+    pub risky_job_ids: Vec<String>,
+    pub cancelled_job_ids: Vec<String>,
+}
+
+pub fn administrator_patrol_intent(content: &str) -> bool {
+    [
+        "巡查",
+        "死循环",
+        "任务死锁",
+        "卡住",
+        "token消耗",
+        "Token消耗",
+        "谁在消耗",
+    ]
+    .iter()
+    .any(|marker| content.contains(marker))
+}
+
+pub fn administrator_intervention_intent(content: &str) -> bool {
+    ["解除死循环", "停止卡住", "取消异常", "解决死锁", "中止异常"]
+        .iter()
+        .any(|marker| content.contains(marker))
+}
+
+pub async fn administrator_patrol(
+    pool: &SqlitePool,
+    company_id: &str,
+    floor_id: &str,
+    current_job_id: &str,
+    intervene: bool,
+) -> Result<AdministratorPatrolResult> {
+    let employees = crate::db::employees(pool, company_id)
+        .await?
+        .into_iter()
+        .filter(|employee| employee.floor_id.as_deref() == Some(floor_id))
+        .filter(|employee| employee.employment_status == "ACTIVE")
+        .collect::<Vec<_>>();
+    let employee_ids = employees
+        .iter()
+        .map(|employee| employee.id.as_str())
+        .collect::<HashSet<_>>();
+    let cutoff = Utc::now() - Duration::minutes(15);
+    let jobs = crate::db::jobs(pool, company_id).await?;
+    let risky_jobs = jobs
+        .iter()
+        .filter(|job| employee_ids.contains(job.employee_id.as_str()))
+        .filter(|job| {
+            job.id != current_job_id && matches!(job.status.as_str(), "RUNNING" | "WAITING")
+        })
+        .filter(|job| {
+            job.attempts >= 3
+                || DateTime::parse_from_rfc3339(&job.updated_at)
+                    .map(|updated_at| updated_at.with_timezone(&Utc) < cutoff)
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    let risky_job_ids = risky_jobs
+        .iter()
+        .map(|job| job.id.clone())
+        .collect::<Vec<_>>();
+    let mut cancelled_job_ids = Vec::new();
+    if intervene {
+        let now = Utc::now().to_rfc3339();
+        for job in &risky_jobs {
+            let changed = sqlx::query(
+                "UPDATE agent_jobs
+                 SET status = 'CANCELLED', error = 'administrator intervention: suspected dead loop or stalled job', updated_at = ?
+                 WHERE id = ? AND company_id = ? AND status IN ('RUNNING', 'WAITING')",
+            )
+            .bind(&now)
+            .bind(&job.id)
+            .bind(company_id)
+            .execute(pool)
+            .await?
+            .rows_affected();
+            if changed > 0 {
+                cancelled_job_ids.push(job.id.clone());
+            }
+        }
+    }
+    let mut employee_lines = Vec::new();
+    for employee in &employees {
+        let usage = crate::db::employee_token_usage(pool, company_id, &employee.id).await?;
+        let active_jobs = jobs
+            .iter()
+            .filter(|job| job.employee_id == employee.id)
+            .filter(|job| matches!(job.status.as_str(), "PENDING" | "RUNNING" | "WAITING"))
+            .count();
+        employee_lines.push(format!(
+            "{}：{} token（in {} / out {} / cache {}），活跃 Job {}",
+            employee.name,
+            usage.total_tokens,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_tokens,
+            active_jobs
+        ));
+    }
+    let conclusion = if risky_job_ids.is_empty() {
+        "当前没有发现重试过多或超过 15 分钟未更新的活跃 Job。".to_string()
+    } else if intervene {
+        format!(
+            "发现 {} 个疑似卡死 Job，已取消 {} 个；员工会等待澄清后的任务再继续。",
+            risky_job_ids.len(),
+            cancelled_job_ids.len()
+        )
+    } else {
+        format!(
+            "发现 {} 个疑似卡死 Job。若要立即干预，请明确说“解除死循环并停止卡住任务”。",
+            risky_job_ids.len()
+        )
+    };
+    Ok(AdministratorPatrolResult {
+        reply: format!(
+            "本层巡查结果：\n{}\n{}",
+            employee_lines.join("\n"),
+            conclusion
+        ),
+        risky_job_ids,
+        cancelled_job_ids,
+    })
 }
 
 pub async fn floors(pool: &SqlitePool, company_id: &str) -> Result<Vec<FloorSummary>, sqlx::Error> {
@@ -157,16 +284,88 @@ pub async fn create_floor(
         .await?;
     }
     insert_default_floor_roles(&mut tx, company_id, &floor_id, &now).await?;
+    let administrator_id =
+        insert_floor_administrator(&mut tx, company_id, &floor_id, floor_number, &name, &now)
+            .await?;
     tx.commit().await?;
+    crate::db::ensure_employee_runtime_binding(pool, company_id, &administrator_id).await?;
     floor(pool, company_id, &floor_id).await
 }
 
+pub async fn ensure_floor_administrators(pool: &SqlitePool) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT f.company_id, f.id, f.floor_number, f.name
+         FROM floors f
+         WHERE f.status = 'ACTIVE' AND NOT EXISTS (
+           SELECT 1 FROM employees e
+           WHERE e.company_id = f.company_id AND e.floor_id = f.id
+             AND e.is_floor_administrator = 1 AND e.employment_status = 'ACTIVE'
+         ) ORDER BY f.company_id, f.floor_number",
+    )
+    .fetch_all(pool)
+    .await?;
+    for row in rows {
+        let company_id: String = row.try_get("company_id")?;
+        let floor_id: String = row.try_get("id")?;
+        let floor_number: i64 = row.try_get("floor_number")?;
+        let floor_name: String = row.try_get("name")?;
+        let now = Utc::now().to_rfc3339();
+        let mut tx = pool.begin().await?;
+        for location in office::floor_locations(&floor_id) {
+            sqlx::query(
+                "INSERT OR IGNORE INTO office_locations
+                 (id, company_id, name, type, room_id, x, y, floor_id, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&location.id)
+            .bind(&company_id)
+            .bind(&location.name)
+            .bind(&location.location_type)
+            .bind(&location.room_id)
+            .bind(f64::from(location.x))
+            .bind(f64::from(location.y))
+            .bind(&floor_id)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "DELETE FROM role_definitions WHERE company_id = ? AND floor_id = ? AND name = 'HR'",
+        )
+        .bind(&company_id)
+        .bind(&floor_id)
+        .execute(&mut *tx)
+        .await?;
+        let administrator_id = insert_floor_administrator(
+            &mut tx,
+            &company_id,
+            &floor_id,
+            floor_number,
+            &floor_name,
+            &now,
+        )
+        .await?;
+        tx.commit().await?;
+        crate::db::ensure_employee_runtime_binding(pool, &company_id, &administrator_id).await?;
+    }
+    Ok(())
+}
+
 pub async fn delete_floor(pool: &SqlitePool, company_id: &str, floor_id: &str) -> Result<()> {
-    let current = floor(pool, company_id, floor_id).await?;
+    floor(pool, company_id, floor_id).await?;
     if floor_id == "floor-01" {
         return Err(anyhow!("基础办公层不能删除"));
     }
-    if current.employee_count > 0 {
+    let active_regular_employees: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM employees
+         WHERE company_id = ? AND floor_id = ? AND employment_status = 'ACTIVE'
+           AND is_floor_administrator = 0",
+    )
+    .bind(company_id)
+    .bind(floor_id)
+    .fetch_one(pool)
+    .await?;
+    if active_regular_employees > 0 {
         return Err(anyhow!("楼层仍有员工，先完成调岗或离职后再删除"));
     }
     let active_hiring: i64 = sqlx::query_scalar(
@@ -181,6 +380,16 @@ pub async fn delete_floor(pool: &SqlitePool, company_id: &str, floor_id: &str) -
         return Err(anyhow!("楼层仍有招聘请求，先关闭招聘请求后再删除"));
     }
     let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE employees
+         SET employment_status = 'TERMINATED', status = 'offline', presence = 'OFFLINE',
+             floor_id = NULL, desk_id = NULL
+         WHERE company_id = ? AND floor_id = ? AND is_floor_administrator = 1",
+    )
+    .bind(company_id)
+    .bind(floor_id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("DELETE FROM role_definitions WHERE company_id = ? AND floor_id = ?")
         .bind(company_id)
         .bind(floor_id)
@@ -444,71 +653,16 @@ pub async fn create_hiring_from_message(
         .execute(&mut *tx)
         .await?;
 
-        for candidate_index in 0..3 {
-            let candidate_id = format!("candidate-{}", Uuid::new_v4());
-            let seed = 20_000_u64 + (position_index as u64) * 100 + candidate_index as u64;
-            let gender = if (seed + candidate_index as u64).is_multiple_of(2) {
-                "female"
-            } else {
-                "male"
-            };
-            let age = 25 + ((seed + candidate_index as u64 * 3) % 12) as u8;
-            let name = candidate_name(position_index, candidate_index);
-            let personality = candidate_personality(seed, &spec.preferences);
-            let skills = candidate_skills(&spec.requirements, seed);
-            let appearance = create_appearance(seed, gender, age);
-            let strengths = if spec.requirements.is_empty() {
-                vec!["能够快速理解岗位目标".to_string()]
-            } else {
-                spec.requirements.iter().take(3).cloned().collect()
-            };
-            let weaknesses = vec!["需要在入职后通过实际任务继续校准".to_string()];
-            let expertise = spec
-                .requirements
-                .iter()
-                .chain(spec.preferences.iter())
-                .take(6)
-                .cloned()
-                .collect::<Vec<_>>();
-            let evaluation = format!(
-                "根据岗位“{}”的要求生成的初筛候选人；匹配 {} 分，建议用户结合实际对话和面试继续判断。",
-                spec.title,
-                78 + (candidate_index as i64 * 5)
-            );
-            sqlx::query(
-                "INSERT INTO candidates
-                 (id, company_id, hiring_request_id, position_id, name, age, gender, title,
-                  personality, skills, work_style, strengths, weaknesses, expertise,
-                  expected_model, agent_runtime, appearance, match_score,
-                  interview_evaluation, status, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mock-office-v1',
-                         'Native Runtime', ?, ?, ?, 'AVAILABLE', ?, ?)",
-            )
-            .bind(&candidate_id)
-            .bind(company_id)
-            .bind(&request_id)
-            .bind(&position_id)
-            .bind(&name)
-            .bind(i64::from(age))
-            .bind(gender)
-            .bind(&spec.title)
-            .bind(serde_json::to_string(&personality)?)
-            .bind(serde_json::to_string(&skills)?)
-            .bind(format!(
-                "先理解岗位目标，再按自己的节奏推进{}。",
-                spec.title
-            ))
-            .bind(serde_json::to_string(&strengths)?)
-            .bind(serde_json::to_string(&weaknesses)?)
-            .bind(serde_json::to_string(&expertise)?)
-            .bind(serde_json::to_string(&appearance)?)
-            .bind(78 + candidate_index as i64 * 5)
-            .bind(evaluation)
-            .bind(&now)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await?;
-        }
+        insert_candidate_set(
+            &mut tx,
+            company_id,
+            &request_id,
+            &position_id,
+            spec,
+            position_index,
+            &now,
+        )
+        .await?;
     }
     tx.commit().await?;
     let request = hiring_requests(pool, company_id)
@@ -520,6 +674,196 @@ pub async fn create_hiring_from_message(
         request,
         floor_id: floor.id,
     })
+}
+
+pub async fn refresh_candidates(
+    pool: &SqlitePool,
+    company_id: &str,
+    request_id: &str,
+) -> Result<HiringRequestSummary> {
+    let mut tx = pool.begin().await?;
+    let positions = sqlx::query(
+        "SELECT id, title, headcount, requirements, preferences
+         FROM hiring_positions WHERE hiring_request_id = ? ORDER BY created_at, id",
+    )
+    .bind(request_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    if positions.is_empty() {
+        return Err(anyhow!("hiring request has no positions"));
+    }
+    let belongs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM hiring_requests WHERE id = ? AND company_id = ?")
+            .bind(request_id)
+            .bind(company_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if belongs == 0 {
+        return Err(anyhow!("hiring request was not found"));
+    }
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE candidates SET status = 'REJECTED', updated_at = ?
+         WHERE company_id = ? AND hiring_request_id = ? AND status = 'AVAILABLE'",
+    )
+    .bind(&now)
+    .bind(company_id)
+    .bind(request_id)
+    .execute(&mut *tx)
+    .await?;
+    for (index, row) in positions.into_iter().enumerate() {
+        let spec = PositionSpec {
+            title: row.try_get("title")?,
+            headcount: row.try_get::<i64, _>("headcount")?.clamp(1, 20) as u8,
+            requirements: json_vec(row.try_get("requirements")?),
+            preferences: json_vec(row.try_get("preferences")?),
+        };
+        let position_id: String = row.try_get("id")?;
+        insert_candidate_set(
+            &mut tx,
+            company_id,
+            request_id,
+            &position_id,
+            &spec,
+            index,
+            &now,
+        )
+        .await?;
+    }
+    sqlx::query(
+        "UPDATE hiring_requests SET status = 'CANDIDATES_READY', updated_at = ? WHERE id = ?",
+    )
+    .bind(&now)
+    .bind(request_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    hiring_requests(pool, company_id)
+        .await?
+        .into_iter()
+        .find(|request| request.id == request_id)
+        .ok_or_else(|| anyhow!("hiring request disappeared after refresh"))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiCandidateSet {
+    candidates: Vec<AiCandidateProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiCandidateProfile {
+    id: String,
+    name: String,
+    age: u8,
+    gender: String,
+    title: String,
+    personality: PersonalityProfile,
+    skills: Vec<SkillProfile>,
+    work_style: String,
+    strengths: Vec<String>,
+    weaknesses: Vec<String>,
+    expertise: Vec<String>,
+    appearance: crate::models::AppearanceProfile,
+    match_score: i64,
+    interview_evaluation: String,
+}
+
+pub async fn apply_ai_candidate_profiles(
+    pool: &SqlitePool,
+    company_id: &str,
+    request_id: &str,
+    model_output: &str,
+) -> Result<HiringRequestSummary> {
+    let json = extract_json_object(model_output)?;
+    let generated: AiCandidateSet = serde_json::from_str(json)?;
+    let request = hiring_requests(pool, company_id)
+        .await?
+        .into_iter()
+        .find(|request| request.id == request_id)
+        .ok_or_else(|| anyhow!("hiring request was not found"))?;
+    let available_ids = request
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.status == "AVAILABLE")
+        .map(|candidate| candidate.id.as_str())
+        .collect::<HashSet<_>>();
+    if generated.candidates.len() != available_ids.len() {
+        return Err(anyhow!(
+            "model must return every available candidate exactly once"
+        ));
+    }
+    let mut seen = HashSet::new();
+    let now = Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    for candidate in generated.candidates {
+        if !available_ids.contains(candidate.id.as_str()) || !seen.insert(candidate.id.clone()) {
+            return Err(anyhow!(
+                "model returned an unknown or duplicate candidate id"
+            ));
+        }
+        if !(18..=75).contains(&candidate.age)
+            || candidate.name.trim().is_empty()
+            || candidate.title.trim().is_empty()
+            || candidate.skills.is_empty()
+            || candidate.skills.len() > 12
+            || candidate.match_score.clamp(0, 100) != candidate.match_score
+        {
+            return Err(anyhow!("model returned invalid candidate fields"));
+        }
+        if candidate
+            .skills
+            .iter()
+            .any(|skill| skill.name.trim().is_empty() || skill.level > 100)
+        {
+            return Err(anyhow!("model returned invalid candidate skills"));
+        }
+        sqlx::query(
+            "UPDATE candidates SET name = ?, age = ?, gender = ?, title = ?, personality = ?,
+             skills = ?, work_style = ?, strengths = ?, weaknesses = ?, expertise = ?,
+             appearance = ?, match_score = ?, interview_evaluation = ?, updated_at = ?
+             WHERE company_id = ? AND hiring_request_id = ? AND id = ? AND status = 'AVAILABLE'",
+        )
+        .bind(candidate.name.trim())
+        .bind(i64::from(candidate.age))
+        .bind(candidate.gender.trim())
+        .bind(candidate.title.trim())
+        .bind(serde_json::to_string(&candidate.personality)?)
+        .bind(serde_json::to_string(&candidate.skills)?)
+        .bind(candidate.work_style.trim())
+        .bind(serde_json::to_string(&candidate.strengths)?)
+        .bind(serde_json::to_string(&candidate.weaknesses)?)
+        .bind(serde_json::to_string(&candidate.expertise)?)
+        .bind(serde_json::to_string(&candidate.appearance)?)
+        .bind(candidate.match_score)
+        .bind(candidate.interview_evaluation.trim())
+        .bind(&now)
+        .bind(company_id)
+        .bind(request_id)
+        .bind(&candidate.id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    hiring_requests(pool, company_id)
+        .await?
+        .into_iter()
+        .find(|request| request.id == request_id)
+        .ok_or_else(|| anyhow!("hiring request disappeared after AI profile update"))
+}
+
+fn extract_json_object(value: &str) -> Result<&str> {
+    let start = value
+        .find('{')
+        .ok_or_else(|| anyhow!("model response did not contain a JSON object"))?;
+    let end = value
+        .rfind('}')
+        .ok_or_else(|| anyhow!("model response did not contain a complete JSON object"))?;
+    if end < start {
+        return Err(anyhow!("model response contained malformed JSON"));
+    }
+    Ok(&value[start..=end])
 }
 
 pub async fn hire_candidate(
@@ -684,6 +1028,41 @@ pub fn hiring_intent(content: &str) -> bool {
             || normalized.contains("岗位")
             || normalized.contains("员工")
             || normalized.contains("职位"))
+}
+
+pub fn candidate_refresh_intent(content: &str) -> bool {
+    [
+        "刷新候选",
+        "换一批",
+        "重新推荐",
+        "重新找",
+        "再找三",
+        "再给三",
+    ]
+    .iter()
+    .any(|marker| content.contains(marker))
+}
+
+pub async fn refresh_latest_candidates(
+    pool: &SqlitePool,
+    company_id: &str,
+    requester_id: &str,
+) -> Result<HiringCreation> {
+    let row = sqlx::query(
+        "SELECT id, floor_id FROM hiring_requests
+         WHERE company_id = ? AND requester_id = ?
+           AND status NOT IN ('CLOSED', 'CANCELLED')
+         ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+    )
+    .bind(company_id)
+    .bind(requester_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow!("还没有可刷新的招聘需求，请先说明要招聘的岗位"))?;
+    let request_id: String = row.try_get("id")?;
+    let floor_id: String = row.try_get("floor_id")?;
+    let request = refresh_candidates(pool, company_id, &request_id).await?;
+    Ok(HiringCreation { floor_id, request })
 }
 
 async fn resolve_floor(pool: &SqlitePool, company_id: &str, content: &str) -> Result<FloorSummary> {
@@ -945,18 +1324,16 @@ async fn insert_default_floor_roles(
     floor_id: &str,
     now: &str,
 ) -> Result<()> {
-    let defaults = [
-        (
-            "HR",
-            vec!["理解招聘需求", "维护候选人流程", "协助员工入职"],
-            vec!["沟通", "人才评估", "组织协调"],
-        ),
-        (
-            "管理员",
-            vec!["维护楼层配置", "管理工位与空间资源", "协助公司运行"],
-            vec!["组织管理", "资源协调", "流程执行"],
-        ),
-    ];
+    let defaults = [(
+        "管理员",
+        vec![
+            "招聘与解雇",
+            "楼层人员与工位管理",
+            "巡查任务与Token消耗",
+            "识别并解除停滞任务",
+        ],
+        vec!["组织管理", "人才评估", "运行巡查", "任务干预"],
+    )];
     for (name, responsibilities, skills) in defaults {
         sqlx::query(
             "INSERT INTO role_definitions
@@ -978,13 +1355,221 @@ async fn insert_default_floor_roles(
     Ok(())
 }
 
-fn candidate_name(position_index: usize, candidate_index: usize) -> String {
+async fn insert_floor_administrator(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    company_id: &str,
+    floor_id: &str,
+    floor_number: i64,
+    floor_name: &str,
+    now: &str,
+) -> Result<String> {
+    let employee_id = format!("employee-{}", Uuid::new_v4());
+    let workstation_id = format!("workstation-{}", Uuid::new_v4());
+    let location_id = office::floor_location_id(floor_id, "hr_desk_01");
+    let room_id = office::floor_room_id(floor_id, "hr-office");
+    sqlx::query(
+        "INSERT OR IGNORE INTO office_locations
+         (id, company_id, name, type, room_id, x, y, floor_id, created_at)
+         VALUES (?, ?, '管理员工位', 'WORKSTATION', ?, 150, 318, ?, ?)",
+    )
+    .bind(&location_id)
+    .bind(company_id)
+    .bind(&room_id)
+    .bind(floor_id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    let location = sqlx::query(
+        "SELECT x, y, room_id FROM office_locations
+         WHERE company_id = ? AND floor_id = ? AND id = ?",
+    )
+    .bind(company_id)
+    .bind(floor_id)
+    .bind(&location_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let x: f64 = location.try_get("x")?;
+    let y: f64 = location.try_get("y")?;
+    let room_id: Option<String> = location.try_get("room_id")?;
+    let seed = Uuid::new_v4().as_u128() as u64;
+    let names = [
+        "安澜", "程知", "江宁", "陆遥", "许衡", "叶清", "周行", "顾安",
+    ];
+    let name = names[(seed as usize) % names.len()];
+    let gender = if seed.is_multiple_of(2) {
+        "female"
+    } else {
+        "male"
+    };
+    let age = 30 + (seed % 9) as u8;
+    let personality = PersonalityProfile {
+        openness: 72,
+        conscientiousness: 92,
+        extraversion: 66,
+        agreeableness: 76,
+        emotional_stability: 88,
+        traits: vec!["有条理".into(), "善于协调".into(), "主动巡查".into()],
+        communication_style: "先确认人员与预算边界，再给出候选和执行建议".into(),
+        decision_style: "依据任务状态、证据和Token预算进行干预".into(),
+    };
+    let skills = vec![
+        SkillProfile {
+            name: "招聘与解雇".into(),
+            level: 90,
+        },
+        SkillProfile {
+            name: "楼层管理".into(),
+            level: 92,
+        },
+        SkillProfile {
+            name: "任务巡查".into(),
+            level: 91,
+        },
+        SkillProfile {
+            name: "Token预算".into(),
+            level: 86,
+        },
+    ];
+    let appearance = create_appearance(seed, gender, age);
+    sqlx::query(
+        "INSERT INTO workstations
+         (id, company_id, floor_id, location_id, room_id, position_x, position_y,
+          orientation, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 70, 210, 'DOWN', 'AVAILABLE', ?, ?)",
+    )
+    .bind(&workstation_id)
+    .bind(company_id)
+    .bind(floor_id)
+    .bind(&location_id)
+    .bind(&room_id)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO employees
+         (id, company_id, name, age, gender, role, department, title, status,
+          personality, skills, appearance, model_config, model_profile_id, desk_id,
+          floor_id, hired_at, current_state, activity, movement, location_id,
+          position_x, position_y, room_id, device, posture, presence, is_floor_administrator)
+         VALUES (?, ?, ?, ?, ?, '楼层管理员', ?, '管理员', 'online', ?, ?, ?,
+                 '{\"provider\":\"mock\",\"model\":\"mock-office-v1\",\"mode\":\"mock\"}',
+                 'mock-profile-01', ?, ?, ?, 'IDLE', 'IDLE', 'STATIONARY', ?, ?, ?, ?,
+                 'COMPUTER', 'SITTING', 'AVAILABLE', 1)",
+    )
+    .bind(&employee_id)
+    .bind(company_id)
+    .bind(name)
+    .bind(i64::from(age))
+    .bind(gender)
+    .bind(format!("管理员办公室 · F{floor_number} {floor_name}"))
+    .bind(serde_json::to_string(&personality)?)
+    .bind(serde_json::to_string(&skills)?)
+    .bind(serde_json::to_string(&appearance)?)
+    .bind(&workstation_id)
+    .bind(floor_id)
+    .bind(now)
+    .bind(&location_id)
+    .bind(x)
+    .bind(y)
+    .bind(&room_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE workstations SET status = 'OCCUPIED', assigned_employee_id = ?, updated_at = ?
+         WHERE id = ? AND company_id = ?",
+    )
+    .bind(&employee_id)
+    .bind(now)
+    .bind(&workstation_id)
+    .bind(company_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(employee_id)
+}
+
+async fn insert_candidate_set(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    company_id: &str,
+    request_id: &str,
+    position_id: &str,
+    spec: &PositionSpec,
+    position_index: usize,
+    now: &str,
+) -> Result<()> {
+    for candidate_index in 0..3 {
+        let candidate_id = format!("candidate-{}", Uuid::new_v4());
+        let seed = Uuid::new_v4().as_u128() as u64;
+        let gender = if seed.is_multiple_of(2) {
+            "female"
+        } else {
+            "male"
+        };
+        let age = 25 + (seed % 16) as u8;
+        let name = candidate_name(seed, position_index, candidate_index);
+        let personality = candidate_personality(seed, &spec.preferences);
+        let skills = candidate_skills(&spec.requirements, seed);
+        let appearance = create_appearance(seed, gender, age);
+        let strengths = if spec.requirements.is_empty() {
+            vec!["能够快速理解岗位目标".to_string()]
+        } else {
+            spec.requirements.iter().take(3).cloned().collect()
+        };
+        let weaknesses = vec!["需要通过实际任务继续验证长期稳定性".to_string()];
+        let expertise = spec
+            .requirements
+            .iter()
+            .chain(spec.preferences.iter())
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>();
+        let match_score = 76 + (seed % 18) as i64;
+        sqlx::query(
+            "INSERT INTO candidates
+             (id, company_id, hiring_request_id, position_id, name, age, gender, title,
+              personality, skills, work_style, strengths, weaknesses, expertise,
+              expected_model, agent_runtime, appearance, match_score,
+              interview_evaluation, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '由录用时模型配置决定',
+                     'Company Agent Runtime', ?, ?, ?, 'AVAILABLE', ?, ?)",
+        )
+        .bind(&candidate_id)
+        .bind(company_id)
+        .bind(request_id)
+        .bind(position_id)
+        .bind(&name)
+        .bind(i64::from(age))
+        .bind(gender)
+        .bind(&spec.title)
+        .bind(serde_json::to_string(&personality)?)
+        .bind(serde_json::to_string(&skills)?)
+        .bind(format!(
+            "由管理员根据“{}”需求拟定，偏好先确认目标再交付。",
+            spec.title
+        ))
+        .bind(serde_json::to_string(&strengths)?)
+        .bind(serde_json::to_string(&weaknesses)?)
+        .bind(serde_json::to_string(&expertise)?)
+        .bind(serde_json::to_string(&appearance)?)
+        .bind(match_score)
+        .bind(format!(
+            "管理员初筛匹配 {match_score} 分；年龄、性别和外观未参与评分。"
+        ))
+        .bind(now)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+fn candidate_name(seed: u64, position_index: usize, candidate_index: usize) -> String {
     let surnames = ["林", "周", "沈", "许", "顾", "唐", "叶", "苏"];
     let given = ["远", "知行", "言川", "清禾", "予安", "宁", "闻", "嘉"];
     format!(
         "{}{}",
-        surnames[(position_index * 3 + candidate_index) % surnames.len()],
-        given[(position_index + candidate_index * 2) % given.len()]
+        surnames[(seed as usize + position_index * 3 + candidate_index) % surnames.len()],
+        given[((seed >> 8) as usize + position_index + candidate_index * 2) % given.len()]
     )
 }
 
@@ -1121,7 +1706,10 @@ fn json_vec(value: String) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_title, extract_count, extract_terms, hiring_intent, parse_position_specs};
+    use super::{
+        administrator_intervention_intent, administrator_patrol_intent, candidate_refresh_intent,
+        derive_title, extract_count, extract_terms, hiring_intent, parse_position_specs,
+    };
 
     #[test]
     fn parses_dynamic_positions_without_role_enum() {
@@ -1139,5 +1727,15 @@ mod tests {
         assert_eq!(extract_count("两个岗位"), 2);
         assert_eq!(derive_title("再要一个做文章审核的人"), "做文章审核");
         assert!(!extract_terms("AI研究").is_empty());
+    }
+
+    #[test]
+    fn detects_administrator_refresh_and_patrol_commands() {
+        assert!(candidate_refresh_intent("这批不合适，换一批候选人"));
+        assert!(administrator_patrol_intent("巡查一下谁在消耗 token"));
+        assert!(administrator_intervention_intent(
+            "解除死循环并停止卡住任务"
+        ));
+        assert!(!administrator_intervention_intent("只查看，不要停止任务"));
     }
 }

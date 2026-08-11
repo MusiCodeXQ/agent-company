@@ -21,6 +21,7 @@ import {
   fetchTerminationPreview,
   provisionEmployeeRuntime as provisionEmployeeRuntimeApi,
   provisionEmployeeWorkspace as provisionEmployeeWorkspaceApi,
+  refreshHiringCandidates as refreshHiringCandidatesApi,
   terminateEmployee as terminateEmployeeApi,
   testModelProfile,
   updateFloor as updateFloorApi,
@@ -77,6 +78,7 @@ interface CompanyStoreActions {
   deleteFloor: (floorId: string) => Promise<void>;
   createWorkstation: (floorId: string) => Promise<void>;
   hireCandidate: (requestId: string, candidateId: string, workstationId?: string) => Promise<HireCandidateResponse>;
+  refreshHiringCandidates: (requestId: string) => Promise<void>;
   loadTerminationPreview: (employeeId: string) => Promise<void>;
   clearTerminationPreview: () => void;
   terminateEmployee: (employeeId: string, input: TerminationInput) => Promise<void>;
@@ -440,7 +442,7 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
             : [...workstations, workstation];
         }
       }
-      if ((event.type === 'hiring.request.created' || event.type === 'hiring.candidates.ready') && payload.request && typeof payload.request === 'object') {
+      if ((event.type === 'hiring.request.created' || event.type === 'hiring.candidates.ready' || event.type === 'hiring.candidates.refreshed') && payload.request && typeof payload.request === 'object') {
         const request = payload.request as HiringRequestSummary;
         hiringRequests = hiringRequests.some((item) => item.id === request.id)
           ? hiringRequests.map((item) => (item.id === request.id ? request : item))
@@ -721,7 +723,7 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
   startMeeting: async (participantIds) => {
     try {
       await createMeeting({
-        title: '三人空间移动验收会议',
+        title: '楼层协作会议',
         participantIds,
         meetingType: 'TEAM',
       });
@@ -790,6 +792,22 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
       return result;
     } catch (error) {
       set({ error: error instanceof Error ? error.message : 'Unable to hire candidate' });
+      throw error;
+    }
+  },
+
+  refreshHiringCandidates: async (requestId) => {
+    try {
+      const request = await refreshHiringCandidatesApi(requestId);
+      set((state) => {
+        if (!state.bootstrap) return state;
+        const hiringRequests = state.bootstrap.hiringRequests.map((item) => (
+          item.id === request.id ? request : item
+        ));
+        return { bootstrap: { ...state.bootstrap, hiringRequests } };
+      });
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : 'Unable to refresh candidates' });
       throw error;
     }
   },

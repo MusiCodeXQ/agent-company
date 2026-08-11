@@ -106,6 +106,10 @@ pub fn router(state: AppState) -> Router {
             "/api/companies/{company_id}/hiring-requests/{request_id}/hire",
             post(hire_candidate),
         )
+        .route(
+            "/api/companies/{company_id}/hiring-requests/{request_id}/refresh",
+            post(refresh_candidates),
+        )
         .route("/api/companies/{company_id}/meetings", post(create_meeting))
         .route(
             "/api/companies/{company_id}/meetings/{meeting_id}/finish",
@@ -438,11 +442,11 @@ async fn post_company_message(
         employees
             .iter()
             .find(|employee| {
-                employee.id == "supervisor-01" && employee.employment_status == "ACTIVE"
+                employee.is_floor_administrator && employee.employment_status == "ACTIVE"
             })
             .or_else(|| {
                 employees.iter().find(|employee| {
-                    employee.id == "hr-01" && employee.employment_status == "ACTIVE"
+                    employee.id == "supervisor-01" && employee.employment_status == "ACTIVE"
                 })
             })
             .map(|employee| employee.id.clone())
@@ -799,6 +803,25 @@ async fn hire_candidate(
         "workstationId": draft.workstation_id,
         "status": if movement.is_some() { "ONBOARDING" } else { "HIRED_AT_ENTRANCE" }
     })))
+}
+
+async fn refresh_candidates(
+    State(state): State<AppState>,
+    Path((company_id, request_id)): Path<(String, String)>,
+) -> Result<Json<crate::models::HiringRequestSummary>, ApiError> {
+    let request = organization::refresh_candidates(&state.pool, &company_id, &request_id)
+        .await
+        .map_err(ApiError::from_anyhow)?;
+    events::emit(
+        &state,
+        &company_id,
+        "hiring.candidates.refreshed",
+        request.requester_id.as_deref(),
+        Some(&request_id),
+        serde_json::json!({ "request": request }),
+    )
+    .await?;
+    Ok(Json(request))
 }
 
 async fn create_meeting(

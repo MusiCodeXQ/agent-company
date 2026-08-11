@@ -130,7 +130,7 @@ pub fn default_office() -> OfficeLayout {
         room("open-office", "workspace", "开放办公区", 260, 120, 850, 580),
         room("meeting-a", "meeting", "协作会议室", 1130, 120, 390, 250),
         room("interview-room", "interview", "面试室", 1130, 390, 390, 210),
-        room("hr-office", "office", "HR 办公室", 40, 120, 190, 260),
+        room("hr-office", "office", "管理员办公室", 40, 120, 190, 260),
         room("reception", "reception", "前台接待", 40, 410, 190, 180),
         room("pantry", "pantry", "茶水间", 1130, 620, 220, 200),
         room("restroom", "restroom", "卫生间", 1370, 620, 150, 200),
@@ -457,9 +457,6 @@ pub fn floor_room_id(floor_id: &str, room_id: &str) -> String {
 fn prefix_floor_layout(layout: &mut OfficeLayout, floor_id: &str) {
     for room in &mut layout.rooms {
         room.id = floor_room_id(floor_id, &room.id);
-        if room.room_type == "office" && room.label == "HR 办公室" {
-            room.label = "空置办公室".to_string();
-        }
     }
     for door in &mut layout.doors {
         door.id = format!("{floor_id}__{}", door.id);
@@ -607,7 +604,7 @@ fn default_locations(
         ),
         location(
             "interview_seat_hr",
-            "面试 HR 座位",
+            "面试管理员座位",
             "INTERVIEW_SEAT",
             Some("interview-room"),
             1160.0,

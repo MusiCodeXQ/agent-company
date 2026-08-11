@@ -206,10 +206,10 @@ pub async fn create_request(
     Ok(record_from_row(row)?)
 }
 
-pub async fn handle_hr_message(
+pub async fn handle_administrator_message(
     state: &AppState,
     company_id: &str,
-    hr_employee_id: &str,
+    administrator_employee_id: &str,
     content: &str,
 ) -> Result<Option<String>> {
     if is_confirmation(content) {
@@ -219,7 +219,7 @@ pub async fn handle_hr_message(
              ORDER BY created_at DESC LIMIT 1",
         )
         .bind(company_id)
-        .bind(hr_employee_id)
+        .bind(administrator_employee_id)
         .fetch_optional(&state.pool)
         .await?
         {
@@ -229,9 +229,9 @@ pub async fn handle_hr_message(
                 state,
                 company_id,
                 &employee_id,
-                hr_employee_id,
+                administrator_employee_id,
                 Some(&termination_id),
-                "由 HR 确认",
+                "由管理员确认",
                 "",
                 "REASSIGN",
                 "ARCHIVE",
@@ -253,7 +253,7 @@ pub async fn handle_hr_message(
         .await?
         .into_iter()
         .find(|employee| {
-            employee.id != hr_employee_id
+            employee.id != administrator_employee_id
                 && employee.employment_status == "ACTIVE"
                 && content.contains(&employee.name)
         });
@@ -264,8 +264,8 @@ pub async fn handle_hr_message(
         &state.pool,
         company_id,
         &employee.id,
-        hr_employee_id,
-        "由 HR 对话发起",
+        administrator_employee_id,
+        "由管理员对话发起",
         content,
     )
     .await?;
@@ -294,6 +294,11 @@ pub async fn start(
         .ok_or_else(|| anyhow!("employee was not found: {employee_id}"))?;
     if employee.employment_status == "TERMINATED" {
         return Err(anyhow!("employee is already terminated"));
+    }
+    if employee.is_floor_administrator {
+        return Err(anyhow!(
+            "楼层管理员不能直接解雇；请先完成管理员交接，以保证楼层始终有管理员"
+        ));
     }
     let termination_id = match termination_id {
         Some(id) => id.to_string(),

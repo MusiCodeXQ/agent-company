@@ -166,6 +166,14 @@ export async function fetchHiringRequests(): Promise<HiringRequestSummary[]> {
   return response.json() as Promise<HiringRequestSummary[]>;
 }
 
+export async function refreshHiringCandidates(requestId: string): Promise<HiringRequestSummary> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/hiring-requests/${encodeURIComponent(requestId)}/refresh`, {
+    method: 'POST',
+  });
+  if (!response.ok) throw await readError(response, 'Candidate refresh failed');
+  return response.json() as Promise<HiringRequestSummary>;
+}
+
 export async function listModelProfiles(): Promise<ModelProfileSummary[]> {
   const response = await fetch('/api/model-profiles');
   if (!response.ok) throw await readError(response, 'Provider list request failed');

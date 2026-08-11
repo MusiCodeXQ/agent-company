@@ -192,7 +192,7 @@ fn mock_meeting_reply(system_prompt: &str, latest: &str) -> String {
         "从质量保障角度，我需要确认：成功标准和不可接受的问题分别是什么？需要覆盖哪些边界场景，谁负责最终验收？"
     } else if contains_any(title, &["产品", "Product"]) {
         "从产品角度，我需要确认：这次工作的目标用户、优先级和成功指标是什么？如果范围冲突，哪个结果优先？"
-    } else if contains_any(title, &["HR", "人事", "招聘", "人才"]) {
+    } else if contains_any(title, &["管理员", "招聘", "人才"]) {
         "从人员和组织角度，我需要确认：需要哪些角色参与、由谁负责决策？时间范围和人员预算边界是什么？"
     } else if contains_any(title, &["财务", "Finance", "会计", "采购"]) {
         "从预算与执行角度，我需要确认：预算上限、审批人和成本口径是什么？哪些支出可以先行，哪些必须事前审批？"

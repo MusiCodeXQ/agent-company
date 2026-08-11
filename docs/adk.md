@@ -224,14 +224,16 @@ POST /internal/runtime/jobs/{id}/complete
 
 V1 推荐反向领取模式。容器只需主动访问 Backend，不必为每个容器开放宿主端口，也更容易鉴权和重连。
 
-当前首版已采用更窄的无端口协议：Backend 通过 `docker exec -i` 将一次 Run JSON 写入员工容器内的 `employee-runtime`，并读取结果 JSON。这保留了“密钥只按次下发”和“容器不开放端口”的边界；当后续需要超长 Run/中断/心跳时，再将同一 JSON 协议迁移到反向领取。
+当前首版已采用更窄的无端口协议：Backend 通过 `docker run --rm -i` 创建一次性员工容器，将 Run JSON 写入容器内的 `employee-runtime`，并读取结果 JSON。这保留了“密钥只按次下发”和“容器不开放端口”的边界；当后续需要超长 Run/中断/心跳时，再将同一 JSON 协议迁移到反向领取。
 
 ### 已落地的目录持久化规则
 
 - `employee_runtime_workspaces` 保存员工的宿主根目录，不保存或复用 container ID。
+- 员工构建阶段和执行阶段统一以 `debian:stable-slim` 为基础，不维护其他发行版变体。
 - 每次 Agent Run 都使用 `docker run --rm` 启动临时容器；Run 结束后容器删除。
-- 员工根目录下的 `workspace/state/artifacts/environment` 挂载到容器，备份和迁移只需处理该员工目录。
-- Python venv、npm global prefix 和 `cargo install` 目录都位于 `environment`，所以安装包不依赖容器 writable layer。
+- 员工根目录下的 `workspace/state/artifacts/environment` 挂载到容器，备份和迁移只需处理该员工目录；其中 `environment` 在容器内作为员工的持久化 `$HOME=/home/employee`。
+- 基础镜像不预装语言或构建工具链。Python、Node.js、Rust、JDK、Gradle、Maven 等由员工安装到个人 `$HOME`，所以升级和缓存都不依赖容器 writable layer。
+- 新建员工目录时生成 `$HOME/.ai-company/RUNTIME_POLICY.md` 和 `toolchains.json`；每次 Run 还会重复注入关键规则，并要求通过 `company_record_personal_toolchain` 登记版本和路径。
 - 安装命令同步写入 `runtime_environment_suggestions`，作为后续统一构建新基础镜像的建议清单。不使用 `docker commit`。
 
 ## 7. 员工如何控制文件和系统命令
@@ -253,7 +255,7 @@ ADK-Rust 的 Coding Agent / DevToolset 能提供受 Workspace 限制的：
 /workspace              # 宿主员工目录/workspace
 /agent-state            # 宿主员工目录/state
 /artifacts              # 宿主员工目录/artifacts
-/employee-env           # 宿主员工目录/environment，保存员工安装的依赖
+/home/employee          # 宿主员工目录/environment，员工持久化 HOME 与个人工具链
 /tmp                    # tmpfs，容器销毁后丢弃
 /runtime                # runtime 二进制和配置，只读
 ```
@@ -286,16 +288,16 @@ volumes:
 | ADK Session / Graph checkpoint | 员工目录 `state` | 新临时容器挂回同一目录后 resume |
 | 项目文件、Git worktree、构建输出 | 员工目录 `workspace` | 下一个 Run 直接挂载 |
 | Artifact | 员工目录 `artifacts` + 公司 DB 元数据 | 通过 artifact_id 找回 |
-| Python/npm/Cargo 员工依赖 | 员工目录 `environment` | 下一个 Run 加入 PATH |
+| Python/Node/Rust/JDK/Gradle/Maven 等个人工具链 | 员工目录 `environment`（容器内 `$HOME`） | 下一个 Run 从 `$HOME/.local/bin` 等路径复用 |
 | 临时进程、内存、`/tmp` | 不保存 | Job 从 checkpoint 恢复 |
-| 系统软件和工具链 | 版本化基础镜像 + Environment Manifest | 用同一 image digest 重建 |
+| 必需的系统库与基础命令 | 版本化基础镜像 + Environment Suggestion | 用同一 image digest 重建 |
 
 建议原则：
 
 1. 容器本身可丢弃，重要状态必须外置。
 2. Workspace、Agent State、Artifact 和依赖环境使用每员工独立的宿主目录。
 3. 基础镜像使用 digest 固定，不使用生产 `latest`。
-4. 员工不直接执行需要 root 的 `apt install`；需要的系统软件写入镜像建议清单。
+4. 员工不直接执行需要 root 的 `apt install`；缺少的系统库或基础命令写入镜像建议清单，语言与构建工具链继续由员工在个人目录维护。
 5. 经审批的环境变更生成 Dockerfile patch，由管理员统一构建版本化基础镜像。
 6. 不使用 `docker commit`；临时容器的 writable layer 永不是公司持久化状态。
 

@@ -121,18 +121,79 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
     let existing_message = db::agent_reply_for_job(&state.pool, &job.id)
         .await
         .context("check for existing agent reply")?;
-    let termination_reply = if existing_message.is_none() && is_hr_job(state, job).await? {
-        offboarding::handle_hr_message(state, &job.company_id, &job.employee_id, &user_content)
+    let termination_reply =
+        if existing_message.is_none() && is_administrator_job(state, job).await? {
+            offboarding::handle_administrator_message(
+                state,
+                &job.company_id,
+                &job.employee_id,
+                &user_content,
+            )
             .await?
+        } else {
+            None
+        };
+    let patrol_result = if existing_message.is_none()
+        && termination_reply.is_none()
+        && employee.is_floor_administrator
+        && organization::administrator_patrol_intent(&user_content)
+    {
+        if let Some(floor_id) = employee.floor_id.as_deref() {
+            Some(
+                organization::administrator_patrol(
+                    &state.pool,
+                    &job.company_id,
+                    floor_id,
+                    &job.id,
+                    organization::administrator_intervention_intent(&user_content),
+                )
+                .await?,
+            )
+        } else {
+            None
+        }
     } else {
         None
     };
-    let hiring_request = if existing_message.is_none()
+    if let Some(result) = patrol_result.as_ref() {
+        events::emit(
+            state,
+            &job.company_id,
+            "administrator.patrol.completed",
+            Some(&job.employee_id),
+            Some(&job.id),
+            json!({
+                "riskyJobIds": result.risky_job_ids,
+                "cancelledJobIds": result.cancelled_job_ids,
+            }),
+        )
+        .await?;
+    }
+    let mut hiring_was_refreshed = false;
+    let mut hiring_request = if existing_message.is_none()
         && termination_reply.is_none()
-        && is_hr_job(state, job).await?
+        && patrol_result.is_none()
+        && is_administrator_job(state, job).await?
     {
-        match organization::hiring_intent(&user_content) {
-            true => match organization::create_hiring_from_message(
+        if organization::candidate_refresh_intent(&user_content) {
+            match organization::refresh_latest_candidates(
+                &state.pool,
+                &job.company_id,
+                &job.employee_id,
+            )
+            .await
+            {
+                Ok(created) => {
+                    hiring_was_refreshed = true;
+                    Some(created)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, job_id = %job.id, "administrator could not refresh candidates");
+                    None
+                }
+            }
+        } else if organization::hiring_intent(&user_content) {
+            match organization::create_hiring_from_message(
                 &state.pool,
                 &job.company_id,
                 &job.employee_id,
@@ -154,20 +215,46 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
                     Some(created)
                 }
                 Err(error) => {
-                    tracing::warn!(%error, job_id = %job.id, "HR message did not produce a structured hiring request");
+                    tracing::warn!(%error, job_id = %job.id, "administrator message did not produce a structured hiring request");
                     None
                 }
-            },
-            false => None,
+            }
+        } else {
+            None
         }
     } else {
         None
     };
+    if let Some(created) = hiring_request.as_mut() {
+        if let Err(error) = personalize_hiring_candidates(state, job, &employee, created).await {
+            tracing::warn!(%error, job_id = %job.id, "administrator model candidate generation failed; keeping local fallback candidates");
+        }
+    }
     let message = if let Some(message) = existing_message {
         message
     } else {
         let reply = if let Some(reply) = termination_reply {
             reply
+        } else if let Some(result) = patrol_result {
+            result.reply
+        } else if let Some(created) = hiring_request.as_ref() {
+            let candidate_count = created
+                .request
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.status == "AVAILABLE")
+                .count();
+            if hiring_was_refreshed {
+                format!(
+                    "我已经为“{}”换了一批候选人，共 {} 位。请在招聘面板查看姓名、年龄、职位、外观、性格与技能；只有你选中并确认录用后，候选人才会成为正式员工。",
+                    created.request.summary, candidate_count
+                )
+            } else {
+                format!(
+                    "我已经根据“{}”整理出 {} 位候选人。请在招聘面板查看并选择；在你确认以前，我不会自动录用任何人。",
+                    created.request.summary, candidate_count
+                )
+            }
         } else if let Some(command) = spatial_command {
             match spatial_commands::execute(state, &job.company_id, &job.employee_id, command).await
             {
@@ -234,7 +321,11 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
         events::emit(
             state,
             &job.company_id,
-            "hiring.candidates.ready",
+            if hiring_was_refreshed {
+                "hiring.candidates.refreshed"
+            } else {
+                "hiring.candidates.ready"
+            },
             Some(&job.employee_id),
             Some(&job.id),
             json!({ "request": created.request, "floorId": created.floor_id }),
@@ -324,6 +415,61 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
     )
     .await?;
     emit_job_state(state, job, "COMPLETED").await?;
+    Ok(())
+}
+
+async fn personalize_hiring_candidates(
+    state: &AppState,
+    job: &AgentJob,
+    employee: &crate::models::Employee,
+    created: &mut organization::HiringCreation,
+) -> Result<()> {
+    let Some(profile_id) = employee.model_profile_id.as_deref() else {
+        return Ok(());
+    };
+    let profile = model_profiles::get_credentials(&state.pool, profile_id).await?;
+    if profile.protocol.eq_ignore_ascii_case("mock") {
+        return Ok(());
+    }
+    let candidate_template = serde_json::to_string(&created.request.candidates)?;
+    let system_prompt = "你是虚拟公司的楼层管理员，负责招聘。请根据招聘需求独立设计候选人的姓名、年龄、性别、职位、性格、技能、工作方式和外观。必须只返回 JSON 对象 {\"candidates\":[...]}，保留每个候选人的 id；字段必须完整并沿用输入 JSON 的 camelCase 结构。skills.level、性格五维和 matchScore 范围为 0..100，appearance 必须保留完整字段。招聘评分只能依据岗位、技能、性格与工作方式，严禁依据年龄、性别或外观评分。";
+    let user_prompt = format!(
+        "招聘需求：{}\n请重写以下候选人模板，每个岗位严格保留三位候选人：\n{}",
+        created.request.summary, candidate_template
+    );
+    let started = Instant::now();
+    let response = llm::chat(
+        &profile,
+        system_prompt,
+        &[ChatMessage {
+            role: "user".to_string(),
+            content: user_prompt,
+        }],
+    )
+    .await?;
+    let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+    db::record_llm_call(
+        &state.pool,
+        db::LlmCallInput {
+            company_id: &job.company_id,
+            employee_id: &job.employee_id,
+            job_id: &job.id,
+            model_profile_id: profile_id,
+            model: &profile.model,
+            status: "COMPLETED",
+            usage: &response.usage,
+            latency_ms,
+            error: None,
+        },
+    )
+    .await?;
+    created.request = organization::apply_ai_candidate_profiles(
+        &state.pool,
+        &job.company_id,
+        &created.request.id,
+        &response.content,
+    )
+    .await?;
     Ok(())
 }
 
@@ -615,16 +761,13 @@ fn job_message_id(job: &AgentJob) -> Option<String> {
         })
 }
 
-async fn is_hr_job(state: &AppState, job: &AgentJob) -> Result<bool> {
+async fn is_administrator_job(state: &AppState, job: &AgentJob) -> Result<bool> {
     let employee = db::employees(&state.pool, &job.company_id)
         .await?
         .into_iter()
         .find(|employee| employee.id == job.employee_id)
         .ok_or_else(|| anyhow!("employee {} was not found", job.employee_id))?;
-    Ok(employee.id == "hr-01"
-        || employee.role.contains("HR")
-        || employee.role.contains("人事")
-        || employee.title.contains("招聘"))
+    Ok(employee.is_floor_administrator)
 }
 
 fn meeting_broadcast_id(job: &AgentJob) -> Option<String> {

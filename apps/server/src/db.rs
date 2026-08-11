@@ -27,6 +27,7 @@ struct EmployeeRow {
     title: String,
     status: String,
     employment_status: String,
+    is_floor_administrator: i64,
     personality: String,
     skills: String,
     appearance: String,
@@ -144,15 +145,10 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "INSERT OR IGNORE INTO role_definitions
          (id, company_id, floor_id, name, responsibilities, skills, preferences, created_at, updated_at)
          VALUES
-           ('role-floor-01-hr', 'company-01', 'floor-01', 'HR',
-            '[\"理解招聘需求\", \"维护候选人流程\", \"协助员工入职\"]',
-            '[\"沟通\", \"人才评估\", \"组织协调\"]', '[]', ?, ?),
            ('role-floor-01-admin', 'company-01', 'floor-01', '管理员',
-            '[\"维护楼层配置\", \"管理工位与空间资源\", \"协助公司运行\"]',
-            '[\"组织管理\", \"资源协调\", \"流程执行\"]', '[]', ?, ?)",
+            '[\"招聘与解雇\", \"楼层人员与工位管理\", \"巡查任务与Token消耗\", \"识别并解除停滞任务\"]',
+            '[\"组织管理\", \"人才评估\", \"运行巡查\", \"任务干预\"]', '[]', ?, ?)",
     )
-    .bind(&now)
-    .bind(&now)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -183,7 +179,7 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                  '[\"company-bridge\"]', '{}', '{}', 1, ?, ?),
                 ('runtime-profile-adk-rust-01', 'company-01', 'ADK-Rust Container Runtime', 'ADK_RUST',
                  'mock-profile-01', 'docker-employee-default',
-                 '{\"workspace\":true,\"bash\":true,\"hostEnvironment\":true,\"softwareSuggestions\":true}',
+                 '{\"workspace\":true,\"bash\":true,\"hostEnvironment\":true,\"personalToolchains\":true,\"softwareSuggestions\":true}',
                  '[\"company-tools\",\"developer-tools\"]', '{}',
                  '{\"maxIterations\":20,\"toolTimeoutSeconds\":120}', 1, ?, ?)",
     )
@@ -208,8 +204,8 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             "INSERT OR IGNORE INTO employees
              (id, company_id, name, age, gender, role, department, title, status,
               personality, skills, appearance, model_config, model_profile_id,
-              desk_id, hired_at, current_state)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              desk_id, hired_at, current_state, is_floor_administrator)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&employee.id)
         .bind(&employee.company_id)
@@ -228,6 +224,7 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .bind(&employee.desk_id)
         .bind(&employee.hired_at)
         .bind(&employee.current_state)
+        .bind(employee.is_floor_administrator)
         .execute(pool)
         .await?;
     }
@@ -541,7 +538,7 @@ pub async fn employees(pool: &SqlitePool, company_id: &str) -> Result<Vec<Employ
     let rows = sqlx::query_as::<_, EmployeeRow>(
         "SELECT employees.id, employees.company_id, employees.name, employees.age, employees.gender,
                 employees.role, employees.department, employees.title, employees.status,
-                employees.employment_status,
+                employees.employment_status, employees.is_floor_administrator,
                 personality, skills, appearance, model_config, model_profile_id, desk_id, floor_id,
                 hired_at, current_state, current_destination,
                 activity, movement, location_id, position_x, position_y, room_id,
@@ -2023,6 +2020,7 @@ fn employee_from_row(
         title: row.title,
         status: row.status,
         employment_status: row.employment_status,
+        is_floor_administrator: row.is_floor_administrator != 0,
         personality: serde_json::from_str(&row.personality).unwrap_or_default(),
         skills: serde_json::from_str(&row.skills).unwrap_or_default(),
         appearance: serde_json::from_str(&row.appearance).unwrap_or_default(),
@@ -2106,6 +2104,7 @@ struct EmployeeSeed {
     desk_id: Option<String>,
     hired_at: String,
     current_state: String,
+    is_floor_administrator: bool,
 }
 
 fn default_employees() -> Vec<EmployeeSeed> {
@@ -2130,11 +2129,11 @@ fn default_employees() -> Vec<EmployeeSeed> {
             "苏晴",
             31,
             "female",
-            "HR",
-            "People",
-            "HR & 招聘",
+            "楼层管理员",
+            "管理员办公室",
+            "管理员",
             "外向、细致、善于观察",
-            &["招聘", "面试组织", "人员档案"],
+            &["招聘与解雇", "楼层巡查", "Token预算", "任务干预"],
             1002,
             "desk-hr-01",
             &now,
@@ -2267,5 +2266,6 @@ fn seed(
         desk_id: Some(desk_id.to_string()),
         hired_at: hired_at.to_string(),
         current_state: "IDLE".to_string(),
+        is_floor_administrator: id == "hr-01",
     }
 }

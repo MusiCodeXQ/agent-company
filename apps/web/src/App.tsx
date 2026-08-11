@@ -85,6 +85,7 @@ export function App(): ReactElement {
   const deleteFloor = useCompanyStore((state) => state.deleteFloor);
   const createWorkstation = useCompanyStore((state) => state.createWorkstation);
   const hireCandidate = useCompanyStore((state) => state.hireCandidate);
+  const refreshHiringCandidates = useCompanyStore((state) => state.refreshHiringCandidates);
   const terminationPreview = useCompanyStore((state) => state.terminationPreview);
   const loadTerminationPreview = useCompanyStore((state) => state.loadTerminationPreview);
   const clearTerminationPreview = useCompanyStore((state) => state.clearTerminationPreview);
@@ -97,6 +98,10 @@ export function App(): ReactElement {
   const phoneEmployee = employees.find((employee) => employee.id === phoneEmployeeId) ?? null;
   const activeMeeting = bootstrap?.meetings.find((meeting) => ['WAITING_FOR_PARTICIPANTS', 'IN_PROGRESS'].includes(meeting.status));
   const activeFloor = bootstrap?.floors.find((floor) => floor.id === activeFloorId) ?? bootstrap?.floors[0];
+  const meetingCandidates = employees
+    .filter((employee) => employee.floorId === activeFloor?.id && employee.employmentStatus === 'ACTIVE')
+    .slice(0, 3)
+    .map((employee) => employee.id);
 
   useEffect(() => {
     let closeSocket: (() => void) | undefined;
@@ -204,7 +209,7 @@ export function App(): ReactElement {
                   <span><i className="legend-dot blue" />会议</span>
                   <span className="zoom-hint">滚轮缩放 · 拖动画布 · 点击人物打开手机</span>
                   <FloorSwitcher floors={bootstrap?.floors ?? []} activeFloorId={activeFloor?.id} onSelect={(floorId) => void loadFloor(floorId)} onCreate={() => setFloorModalOpen(true)} />
-                  <button className="send-button spatial-demo-button" type="button" onClick={() => void startMeeting(['backend-01', 'frontend-01', 'qa-01'])}>召开三人会议</button>
+                  <button className="send-button spatial-demo-button" type="button" disabled={meetingCandidates.length < 2} onClick={() => void startMeeting(meetingCandidates)}>召开本层会议</button>
                   {activeMeeting && <button className="ghost-button" type="button" onClick={() => void finishMeeting(activeMeeting.id)}>结束会议并回工位</button>}
                 </div>
               </div>
@@ -233,7 +238,7 @@ export function App(): ReactElement {
                   />
                 ))}
               </div>
-              {bootstrap && <HiringPanel activeFloorId={activeFloor?.id} requests={bootstrap.hiringRequests} workstations={bootstrap.workstations} onHire={hireCandidate} onAddWorkstation={() => activeFloor && void createWorkstation(activeFloor.id)} />}
+              {bootstrap && <HiringPanel activeFloorId={activeFloor?.id} requests={bootstrap.hiringRequests} workstations={bootstrap.workstations} onHire={hireCandidate} onRefresh={refreshHiringCandidates} onAddWorkstation={() => activeFloor && void createWorkstation(activeFloor.id)} />}
               {selected && <EmployeeProfile employee={selected} onOpenPhone={() => void openPhone(selected.id)} onRequestTermination={() => void loadTerminationPreview(selected.id)} />}
             </aside>
           </>
@@ -288,7 +293,7 @@ function FloorMissionCard({ floor, canDelete, onSave, onDelete }: { floor: Floor
     setMission(floor.mission);
     setEditing(false);
   }, [floor.id, floor.mission]);
-  return <section className="floor-mission-card"><div><span className="eyebrow">FLOOR MISSION · F{floor.floorNumber}</span>{editing ? <input value={name} onChange={(event) => setName(event.target.value)} aria-label="楼层名称" /> : <strong>{floor.name}</strong>}<p>{floor.mission || '还没有定义职责。可以直接告诉 HR 或在这里补充这一层的使命。'}</p><div className="floor-role-chips">{floor.roles.map((role) => <span key={role.id}>{role.name}</span>)}</div></div><div className="floor-actions"><button className="ghost-button" type="button" onClick={() => { if (editing) onSave(name.trim(), mission.trim()); setEditing(!editing); }}>{editing ? '保存' : '编辑楼层'}</button>{canDelete && <button className="danger-button" type="button" onClick={onDelete}>删除</button>}</div>{editing && <textarea value={mission} onChange={(event) => setMission(event.target.value)} rows={2} placeholder="例如：负责科技类内容的选题、研究、创作与审核。" />}</section>;
+  return <section className="floor-mission-card"><div><span className="eyebrow">FLOOR MISSION · F{floor.floorNumber}</span>{editing ? <input value={name} onChange={(event) => setName(event.target.value)} aria-label="楼层名称" /> : <strong>{floor.name}</strong>}<p>{floor.mission || '还没有定义职责。可以直接告诉本层管理员，或在这里补充这一层的使命。'}</p><div className="floor-role-chips">{floor.roles.map((role) => <span key={role.id}>{role.name}</span>)}</div></div><div className="floor-actions"><button className="ghost-button" type="button" onClick={() => { if (editing) onSave(name.trim(), mission.trim()); setEditing(!editing); }}>{editing ? '保存' : '编辑楼层'}</button>{canDelete && <button className="danger-button" type="button" onClick={onDelete}>删除</button>}</div>{editing && <textarea value={mission} onChange={(event) => setMission(event.target.value)} rows={2} placeholder="例如：负责科技类内容的选题、研究、创作与审核。" />}</section>;
 }
 
 function CreateFloorModal({ onClose, onCreate }: { onClose: () => void; onCreate: (name: string, mission?: string) => Promise<void> }): ReactElement {
@@ -305,7 +310,7 @@ function CreateFloorModal({ onClose, onCreate }: { onClose: () => void; onCreate
       setSaving(false);
     }
   }
-  return <div className="simple-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><form className="simple-modal" onSubmit={submit}><div className="modal-heading"><div><span className="eyebrow">CREATE FLOOR</span><h2>新建楼层</h2></div><button type="button" onClick={onClose} aria-label="关闭">×</button></div><label>楼层名称<input autoFocus required value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：自媒体中心" /></label><label>初始使命 <small>可稍后编辑</small><textarea value={mission} onChange={(event) => setMission(event.target.value)} rows={3} placeholder="例如：负责科技类内容的选题、研究、创作与审核。" /></label><p className="modal-hint">系统自动分配下一个 F 编号，创建空的基础办公空间，并预置 HR、管理员两个可扩展角色。</p><div className="modal-actions"><button className="ghost-button" type="button" onClick={onClose}>取消</button><button className="send-button" type="submit" disabled={saving}>{saving ? '创建中…' : '创建楼层'}</button></div></form></div>;
+  return <div className="simple-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><form className="simple-modal" onSubmit={submit}><div className="modal-heading"><div><span className="eyebrow">CREATE FLOOR</span><h2>新建楼层</h2></div><button type="button" onClick={onClose} aria-label="关闭">×</button></div><label>楼层名称<input autoFocus required value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：自媒体中心" /></label><label>初始使命 <small>可稍后编辑</small><textarea value={mission} onChange={(event) => setMission(event.target.value)} rows={3} placeholder="例如：负责科技类内容的选题、研究、创作与审核。" /></label><p className="modal-hint">系统自动分配下一个 F 编号，并创建管理员办公室、管理员 Agent 和专属工位。管理员负责招聘、解雇与运行巡查。</p><div className="modal-actions"><button className="ghost-button" type="button" onClick={onClose}>取消</button><button className="send-button" type="submit" disabled={saving}>{saving ? '创建中…' : '创建楼层'}</button></div></form></div>;
 }
 
 function HiringPanel({
@@ -313,18 +318,21 @@ function HiringPanel({
   requests,
   workstations,
   onHire,
+  onRefresh,
   onAddWorkstation,
 }: {
   activeFloorId?: string;
   requests: HiringRequestSummary[];
   workstations: Array<{ id: string; status: string }>;
   onHire: (requestId: string, candidateId: string, workstationId?: string) => Promise<unknown>;
+  onRefresh: (requestId: string) => Promise<void>;
   onAddWorkstation: () => void;
 }): ReactElement {
   const [busyCandidateId, setBusyCandidateId] = useState<string | null>(null);
+  const [refreshingRequestId, setRefreshingRequestId] = useState<string | null>(null);
   const available = workstations.filter((workstation) => workstation.status === 'AVAILABLE');
   const activeRequests = requests.filter((request) => request.floorId === activeFloorId && request.candidates.some((candidate) => candidate.status === 'AVAILABLE'));
-  if (activeRequests.length === 0) return <section className="hiring-panel"><div className="section-title">招聘 PIPELINE</div><p className="panel-muted">和 HR 苏晴聊天后，候选人会出现在这里。候选人不会自动入职。</p></section>;
+  if (activeRequests.length === 0) return <section className="hiring-panel"><div className="section-title">招聘 PIPELINE</div><p className="panel-muted">和本层管理员聊天提出招聘需求，三名候选人会出现在这里。候选人不会自动入职。</p></section>;
   async function hire(requestId: string, candidate: CandidateSummary): Promise<void> {
     if (!available[0] || busyCandidateId) return;
     setBusyCandidateId(candidate.id);
@@ -334,7 +342,16 @@ function HiringPanel({
       setBusyCandidateId(null);
     }
   }
-  return <section className="hiring-panel"><div className="hiring-panel-heading"><div><div className="section-title">招聘 PIPELINE</div><p className="panel-muted">选择候选人后才会创建 Employee，并从公司入口开始入职移动。</p></div>{available.length === 0 && <button className="ghost-button" type="button" onClick={onAddWorkstation}>＋ 新增工位</button>}</div>{activeRequests.slice(0, 3).map((request) => <div className="hiring-request" key={request.id}><div className="hiring-request-title"><strong>{request.summary}</strong><span>{request.status}</span></div>{request.positions.map((position) => <div className="position-group" key={position.id}><div className="position-label">{position.title} · 需要 {position.headcount} 人</div><div className="candidate-list">{request.candidates.filter((candidate) => candidate.positionId === position.id && candidate.status === 'AVAILABLE').map((candidate) => <CandidateCard candidate={candidate} key={candidate.id} disabled={!available[0] || busyCandidateId !== null} onHire={() => void hire(request.id, candidate)} />)}</div></div>)}</div>)}</section>;
+  async function refresh(requestId: string): Promise<void> {
+    if (refreshingRequestId || busyCandidateId) return;
+    setRefreshingRequestId(requestId);
+    try {
+      await onRefresh(requestId);
+    } finally {
+      setRefreshingRequestId(null);
+    }
+  }
+  return <section className="hiring-panel"><div className="hiring-panel-heading"><div><div className="section-title">招聘 PIPELINE</div><p className="panel-muted">选择候选人后才会创建 Employee，并从公司入口开始入职移动。</p></div>{available.length === 0 && <button className="ghost-button" type="button" onClick={onAddWorkstation}>＋ 新增工位</button>}</div>{activeRequests.slice(0, 3).map((request) => <div className="hiring-request" key={request.id}><div className="hiring-request-title"><strong>{request.summary}</strong><div><span>{request.status}</span><button className="ghost-button" type="button" disabled={refreshingRequestId !== null || busyCandidateId !== null} onClick={() => void refresh(request.id)}>{refreshingRequestId === request.id ? '生成中…' : '换一批候选人'}</button></div></div>{request.positions.map((position) => <div className="position-group" key={position.id}><div className="position-label">{position.title} · 需要 {position.headcount} 人</div><div className="candidate-list">{request.candidates.filter((candidate) => candidate.positionId === position.id && candidate.status === 'AVAILABLE').map((candidate) => <CandidateCard candidate={candidate} key={candidate.id} disabled={!available[0] || busyCandidateId !== null || refreshingRequestId !== null} onHire={() => void hire(request.id, candidate)} />)}</div></div>)}</div>)}</section>;
 }
 
 function CandidateCard({ candidate, disabled, onHire }: { candidate: CandidateSummary; disabled: boolean; onHire: () => void }): ReactElement {

@@ -84,6 +84,7 @@ pub struct Employee {
     pub title: String,
     pub status: String,
     pub employment_status: String,
+    pub is_floor_administrator: bool,
     pub personality: PersonalityProfile,
     pub skills: Vec<SkillProfile>,
     pub appearance: AppearanceProfile,

@@ -28,7 +28,7 @@ impl ContainerEngineConfig {
             enabled: env_flag("AI_COMPANY_DOCKER_ENABLED"),
             binary: env::var("AI_COMPANY_DOCKER_BIN").unwrap_or_else(|_| "docker".to_string()),
             default_image: env::var("AI_COMPANY_EMPLOYEE_IMAGE")
-                .unwrap_or_else(|_| "ai-company/employee-base:ubuntu24".to_string()),
+                .unwrap_or_else(|_| "ai-company/employee-base:debian-stable".to_string()),
             employee_root: env::var("AI_COMPANY_EMPLOYEE_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("data/employee-runtimes")),
@@ -177,7 +177,8 @@ impl ContainerEngine for DockerCliEngine {
             safe_resource_name(&request.employee_id),
             safe_resource_name(&request.run_id)
         );
-        let path = "/employee-env/python-venv/bin:/employee-env/npm/bin:/employee-env/cargo/bin:/opt/python-venv/bin:/opt/cargo/bin:/opt/java/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        let employee_home = "/home/employee";
+        let path = "/home/employee/.local/bin:/home/employee/bin:/home/employee/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
         let mut command = Command::new(&self.config.binary);
         command.kill_on_drop(true);
         let mut child = command
@@ -209,7 +210,7 @@ impl ContainerEngine for DockerCliEngine {
                 "--volume",
                 &bind_mount(&request.artifacts_path, "/artifacts")?,
                 "--volume",
-                &bind_mount(&request.environment_path, "/employee-env")?,
+                &bind_mount(&request.environment_path, employee_home)?,
                 "--tmpfs",
                 "/tmp:rw,nosuid,nodev,size=268435456",
                 "--cpus",
@@ -221,19 +222,27 @@ impl ContainerEngine for DockerCliEngine {
                 "--add-host",
                 "host.docker.internal:host-gateway",
                 "--env",
-                "HOME=/agent-state/home",
+                &format!("HOME={employee_home}"),
                 "--env",
-                "VIRTUAL_ENV=/employee-env/python-venv",
+                &format!("XDG_CONFIG_HOME={employee_home}/.config"),
                 "--env",
-                "NPM_CONFIG_PREFIX=/employee-env/npm",
+                &format!("XDG_CACHE_HOME={employee_home}/.cache"),
                 "--env",
-                "CARGO_INSTALL_ROOT=/employee-env/cargo",
+                &format!("XDG_DATA_HOME={employee_home}/.local/share"),
+                "--env",
+                &format!("NPM_CONFIG_PREFIX={employee_home}/.local"),
+                "--env",
+                &format!("CARGO_HOME={employee_home}/.cargo"),
+                "--env",
+                &format!("RUSTUP_HOME={employee_home}/.rustup"),
+                "--env",
+                &format!("GRADLE_USER_HOME={employee_home}/.gradle"),
                 "--env",
                 &format!("PATH={path}"),
                 &self.config.default_image,
                 "/bin/bash",
                 "-c",
-                "mkdir -p /agent-state/home /employee-env/npm /employee-env/cargo; if [ ! -x /employee-env/python-venv/bin/python ]; then python3 -m venv /employee-env/python-venv; fi; exec /usr/local/bin/employee-runtime run",
+                "mkdir -p /agent-state /home/employee/.local/bin /home/employee/.local/opt /home/employee/.local/share /home/employee/.cache /home/employee/.config /home/employee/.cargo /home/employee/.rustup /home/employee/.gradle /home/employee/.m2 /home/employee/.ai-company; exec /usr/local/bin/employee-runtime run",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -188,6 +188,7 @@ export interface Employee {
   title: string;
   status: string;
   employmentStatus: 'ACTIVE' | 'SUSPENDED' | 'TERMINATING' | 'TERMINATED' | string;
+  isFloorAdministrator: boolean;
   personality: PersonalityProfile;
   skills: SkillProfile[];
   appearance: AppearanceProfile;
