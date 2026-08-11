@@ -4,6 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 
 use crate::{
+    adk_runtime,
     app_state::AppState,
     db::{self, AgentJob},
     events,
@@ -405,6 +406,15 @@ async fn generate_reply(state: &AppState, job: &AgentJob) -> Result<String> {
             .join("、")
         )
     };
+    if employee.runtime_binding.as_ref().is_some_and(|binding| {
+        binding.runtime_type == "ADK_RUST"
+            && binding.provision_status == "READY"
+            && binding.runtime_status != "ARCHIVED"
+            && binding.runtime_status != "DISABLED"
+    }) {
+        return adk_runtime::run_turn(state, job, &employee, profile_id, &profile, &system_prompt)
+            .await;
+    }
     if openclaw::config().enabled
         && employee.runtime_binding.as_ref().is_some_and(|binding| {
             binding.runtime_type == "OPENCLAW"
@@ -582,7 +592,7 @@ async fn generate_reply(state: &AppState, job: &AgentJob) -> Result<String> {
     }
 }
 
-fn job_message_content(job: &AgentJob) -> String {
+pub(crate) fn job_message_content(job: &AgentJob) -> String {
     serde_json::from_str::<serde_json::Value>(&job.payload)
         .ok()
         .and_then(|value| {

@@ -2,11 +2,13 @@ import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from
 import type { ReactElement } from 'react';
 import { OfficeCanvas } from './office/OfficeCanvas';
 import { selectedEmployee, useCompanyStore } from './store/company-store';
+import { formatTokens } from './domain/format';
 import type {
   ActorState,
   AgentJobSummary,
   AgentMemoryRecord,
   CandidateSummary,
+  ContainerRuntimeStatus,
   DomainEvent,
   Employee,
   FloorSummary,
@@ -15,6 +17,7 @@ import type {
   MessageRecord,
   ModelProfileSummary,
   OpenClawStatus,
+  RuntimeEnvironmentSuggestionSummary,
   TokenUsageSummary,
   TerminationPreview,
 } from './domain/types';
@@ -185,7 +188,7 @@ export function App(): ReactElement {
 
         {activeView === 'models' ? (
           <main className="models-column">
-            <ModelProviderPage providers={bootstrap?.modelProfiles ?? []} employees={employees} openclaw={bootstrap?.openclaw} />
+            <ModelProviderPage providers={bootstrap?.modelProfiles ?? []} employees={employees} openclaw={bootstrap?.openclaw} containerRuntime={bootstrap?.containerRuntime} environmentSuggestions={bootstrap?.environmentSuggestions ?? []} />
           </main>
         ) : (
           <>
@@ -362,12 +365,13 @@ function TerminationModal({ preview, onClose, onConfirm }: { preview: Terminatio
   return <div className="termination-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="termination-modal" role="dialog" aria-modal="true" aria-label="员工离职预览"><div className="termination-heading"><div><span className="eyebrow">OFFBOARDING PREVIEW</span><h2>解雇 {preview.employee.name}</h2></div><button type="button" onClick={onClose} aria-label="关闭">×</button></div><p className="termination-warning">这不会删除员工。聊天、会议、Job、任务和工作记录会继续保留；员工会先完成交接、停止 Runtime，再沿办公室路线离开。</p><div className="termination-metrics"><span>未完成任务<strong>{preview.activeTaskCount}</strong></span><span>运行中 Job<strong>{preview.runningJobCount}</strong></span><span>关联 Goal<strong>{preview.activeGoalCount}</strong></span><span>进行中会议<strong>{preview.activeMeetingCount}</strong></span><span>Workspace<strong>{preview.workspaceStatus}</strong></span><span>Runtime<strong>{preview.runtimeType} / {preview.runtimeStatus}</strong></span></div>{preview.tasks.length > 0 && <div className="termination-task-list"><div className="section-title">任务交接对象</div>{preview.tasks.slice(0, 6).map((task) => <div key={task.id}><span>{task.title}</span><small>{task.status}</small></div>)}</div>}<div className="termination-form"><label>任务处理<select value={taskAction} onChange={(event) => setTaskAction(event.target.value as TerminationInput['taskAction'])}><option value="REASSIGN">标记为待重新分配</option><option value="PAUSE">先暂停</option><option value="CANCEL">取消任务</option></select></label><label>Workspace<select value={workspaceAction} onChange={(event) => setWorkspaceAction(event.target.value as TerminationInput['workspaceAction'])}><option value="ARCHIVE">归档保留</option><option value="READ_ONLY">保留为只读</option></select></label><label>原因<input value={reason} onChange={(event) => setReason(event.target.value)} /></label><label>备注<textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={2} /></label></div><div className="termination-actions"><button className="ghost-button" type="button" onClick={onClose}>取消</button><button className="danger-button" type="button" onClick={() => void submit()} disabled={saving}>{saving ? '处理中…' : confirming ? '再次确认并开始离职' : '查看影响后继续'}</button></div></section></div>;
 }
 
-function ModelProviderPage({ providers, employees, openclaw }: { providers: ModelProfileSummary[]; employees: Employee[]; openclaw?: OpenClawStatus }): ReactElement {
+function ModelProviderPage({ providers, employees, openclaw, containerRuntime, environmentSuggestions }: { providers: ModelProfileSummary[]; employees: Employee[]; openclaw?: OpenClawStatus; containerRuntime?: ContainerRuntimeStatus; environmentSuggestions: RuntimeEnvironmentSuggestionSummary[] }): ReactElement {
   const saveProvider = useCompanyStore((state) => state.saveProvider);
   const testProvider = useCompanyStore((state) => state.testProvider);
   const bindEmployeeModel = useCompanyStore((state) => state.bindEmployeeModel);
   const testOpenClaw = useCompanyStore((state) => state.testOpenClaw);
   const provisionEmployeeRuntime = useCompanyStore((state) => state.provisionEmployeeRuntime);
+  const provisionEmployeeWorkspace = useCompanyStore((state) => state.provisionEmployeeWorkspace);
   const [editingId, setEditingId] = useState<string | undefined>();
   const [form, setForm] = useState<ModelProfileInput>(emptyProvider());
   const [status, setStatus] = useState<string | null>(null);
@@ -441,6 +445,18 @@ function ModelProviderPage({ providers, employees, openclaw }: { providers: Mode
     }
   }
 
+  async function provisionWorkspace(employee: Employee): Promise<void> {
+    setOpenclawBusy(true);
+    try {
+      await provisionEmployeeWorkspace(employee.id);
+      setStatus(`${employee.name} 已绑定宿主机员工目录；任务使用临时容器，文件和依赖持续保留。`);
+    } catch {
+      setStatus('员工目录创建失败：请确认后端已启用 Docker 并且对配置的根目录有写权限。');
+    } finally {
+      setOpenclawBusy(false);
+    }
+  }
+
   return (
     <section className="models-page">
       <div className="models-heading">
@@ -450,6 +466,10 @@ function ModelProviderPage({ providers, employees, openclaw }: { providers: Mode
       <section className="runtime-control-card">
         <div><span className="eyebrow">OPTIONAL AGENT RUNTIME</span><h2>OpenClaw Gateway</h2><p>{openclaw?.enabled ? `地址：${openclaw.gatewayUrl}` : '当前未启用；系统继续使用内置 Mock / Provider Runtime。'}</p>{openclaw?.lastError && <small>{openclaw.lastError}</small>}</div>
         <div className="runtime-control-actions"><span className={`enabled-pill ${openclaw?.reachable ? 'on' : ''}`}>{openclaw?.reachable ? 'Gateway 在线' : openclaw?.enabled ? '未连接' : '未启用'}</span><button className="ghost-button" type="button" onClick={() => void checkOpenClaw()} disabled={openclawBusy}>测试 Gateway</button></div>
+      </section>
+      <section className="runtime-control-card">
+        <div><span className="eyebrow">EPHEMERAL CONTAINER RUNTIME</span><h2>ADK Rust + Docker</h2><p>{containerRuntime?.enabled ? `临时执行镜像：${containerRuntime.defaultImage}。每位员工的文件、Session 和依赖保存在宿主机独立目录。` : '当前未启用；设置 AI_COMPANY_DOCKER_ENABLED=true 后使用一次性任务容器。'}</p>{containerRuntime?.lastError && <small>{containerRuntime.lastError}</small>}</div>
+        <div className="runtime-control-actions"><span className={`enabled-pill ${containerRuntime?.available ? 'on' : ''}`}>{containerRuntime?.available ? `Docker ${containerRuntime.engineVersion ?? '在线'}` : containerRuntime?.enabled ? '不可用' : '未启用'}</span></div>
       </section>
       <div className="models-grid">
         <div className="provider-list">
@@ -475,7 +495,7 @@ function ModelProviderPage({ providers, employees, openclaw }: { providers: Mode
           <button className="send-button" type="submit" disabled={saving}>{saving ? '保存中…' : '保存 Provider'}</button>
           {status && <div className="provider-status">{status}</div>}
           <p className="security-note">API Key 使用 `MODEL_PROFILE_ENCRYPTION_KEY` 派生的 AES-256-GCM 加密保存。请在运行 Rust 后端的 WSL 环境设置该变量。</p>
-          <div className="binding-section"><div className="section-title">AGENT 模型绑定</div><p className="binding-note">Agent 只保存 model_profile_id，不保存 Base URL 或 API Key。</p>{employees.map((employee) => <div className="binding-row" key={employee.id}><label><span>{employee.name}<small>{employee.title}</small></span><select value={employee.modelProfileId ?? ''} onChange={(event) => void bindEmployeeModel(employee.id, event.target.value || null)}><option value="">未绑定</option>{providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name} · {provider.model}</option>)}</select></label><div className="runtime-binding"><small>{employee.runtimeBinding?.runtimeType ?? 'MOCK'} · {employee.runtimeBinding?.provisionStatus ?? 'READY'}</small>{employee.employmentStatus === 'ACTIVE' && employee.runtimeBinding?.runtimeType !== 'OPENCLAW' && <button className="ghost-button" type="button" onClick={() => void provision(employee)} disabled={openclawBusy}>绑定 OpenClaw</button>}</div></div>)}</div>
+          <div className="binding-section"><div className="section-title">AGENT 模型与 RUNTIME 绑定</div><p className="binding-note">API Key 按次下发。ADK 不保存 container ID；文件和安装依赖直接持久化到宿主机员工目录。</p>{employees.map((employee) => { const suggestions = environmentSuggestions.filter((item) => item.employeeId === employee.id && item.status === 'SUGGESTED'); return <div className="binding-row" key={employee.id}><label><span>{employee.name}<small>{employee.title}</small></span><select value={employee.modelProfileId ?? ''} onChange={(event) => void bindEmployeeModel(employee.id, event.target.value || null)}><option value="">未绑定</option>{providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name} · {provider.model}</option>)}</select></label><div className="runtime-binding"><small>{employee.runtimeBinding?.runtimeType ?? 'MOCK'} · {employee.runtimeBinding?.provisionStatus ?? 'READY'}</small>{employee.runtimeBinding?.runtimeType === 'ADK_RUST' && <small title={employee.runtimeBinding.workspacePath}>{employee.runtimeBinding.workspacePath}</small>}{suggestions.length > 0 && <small>镜像建议：{suggestions.slice(0, 3).map((item) => `${item.packageName}${item.requestedSpec ?? ''}`).join('、')}{suggestions.length > 3 ? ` 等 ${suggestions.length} 项` : ''}</small>}{employee.employmentStatus === 'ACTIVE' && employee.runtimeBinding?.runtimeType !== 'OPENCLAW' && <button className="ghost-button" type="button" onClick={() => void provision(employee)} disabled={openclawBusy}>绑定 OpenClaw</button>}{employee.employmentStatus === 'ACTIVE' && <button className="ghost-button" type="button" onClick={() => void provisionWorkspace(employee)} disabled={openclawBusy}>{employee.runtimeBinding?.runtimeType === 'ADK_RUST' ? '检查员工目录' : '创建员工目录'}</button>}</div></div>; })}</div>
         </form>
       </div>
     </section>
@@ -738,14 +758,6 @@ function totalUnread(employees: Employee[]): number {
 
 function formatTime(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date(value));
-}
-
-function formatTokens(value: number): string {
-  if (value < 1_000) return Math.max(0, value).toLocaleString('zh-CN');
-  return new Intl.NumberFormat('zh-CN', {
-    notation: 'compact',
-    maximumFractionDigits: 1,
-  }).format(value);
 }
 
 function genderLabel(gender: Employee['gender']): string {

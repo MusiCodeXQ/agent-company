@@ -8,6 +8,7 @@ import type {
   MessageRecord,
   ModelProfileSummary,
   OpenClawStatus,
+  RuntimeWorkspaceSummary,
   Employee,
   MeetingSummary,
   TerminationPreview,
@@ -223,6 +224,16 @@ export async function provisionEmployeeRuntime(employeeId: string): Promise<Empl
   const response = await fetch(`/api/companies/${COMPANY_ID}/employees/${encodeURIComponent(employeeId)}/runtime/provision`, { method: 'POST' });
   if (!response.ok) throw await readError(response, 'OpenClaw runtime provisioning failed');
   return response.json() as Promise<Employee>;
+}
+
+export async function provisionEmployeeWorkspace(employeeId: string): Promise<RuntimeWorkspaceSummary> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/employees/${encodeURIComponent(employeeId)}/runtime/workspace`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ runtimeType: 'ADK_RUST' }),
+  });
+  if (!response.ok) throw await readError(response, 'ADK Rust workspace provisioning failed');
+  return response.json() as Promise<RuntimeWorkspaceSummary>;
 }
 
 export async function sendCompanyMessage(content: string, employeeId?: string): Promise<MessageSendResponse> {

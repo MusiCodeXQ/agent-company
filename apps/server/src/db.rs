@@ -60,6 +60,8 @@ struct EmployeeRow {
     agent_dir: Option<String>,
     provision_status: Option<String>,
     runtime_status: Option<String>,
+    environment_path: Option<String>,
+    artifacts_path: Option<String>,
     last_health_at: Option<String>,
     runtime_last_error: Option<String>,
     runtime_created_at: Option<String>,
@@ -178,8 +180,15 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                 ('runtime-profile-openclaw-01', 'company-01', 'OpenClaw Agent Runtime', 'OPENCLAW',
                  'mock-profile-01', NULL,
                  '{\"companyTools\":true,\"sessionsSend\":false}',
-                 '[\"company-bridge\"]', '{}', '{}', 1, ?, ?)",
+                 '[\"company-bridge\"]', '{}', '{}', 1, ?, ?),
+                ('runtime-profile-adk-rust-01', 'company-01', 'ADK-Rust Container Runtime', 'ADK_RUST',
+                 'mock-profile-01', 'docker-employee-default',
+                 '{\"workspace\":true,\"bash\":true,\"hostEnvironment\":true,\"softwareSuggestions\":true}',
+                 '[\"company-tools\",\"developer-tools\"]', '{}',
+                 '{\"maxIterations\":20,\"toolTimeoutSeconds\":120}', 1, ?, ?)",
     )
+    .bind(&now)
+    .bind(&now)
     .bind(&now)
     .bind(&now)
     .bind(&now)
@@ -556,6 +565,8 @@ pub async fn employees(pool: &SqlitePool, company_id: &str) -> Result<Vec<Employ
                 binding.agent_dir,
                 binding.provision_status,
                 binding.runtime_status,
+                binding.environment_path,
+                binding.artifacts_path,
                 binding.last_health_at,
                 binding.last_error AS runtime_last_error,
                 binding.created_at AS runtime_created_at,
@@ -627,6 +638,9 @@ pub async fn set_openclaw_runtime_binding(
          SET runtime_type = 'OPENCLAW', runtime_agent_id = ?,
              runtime_profile_id = 'runtime-profile-openclaw-01', workspace_path = ?,
              agent_dir = ?, provision_status = 'READY', runtime_status = 'ACTIVE',
+             container_id = NULL, container_name = NULL, image_ref = NULL,
+             workspace_volume = NULL, state_volume = NULL, artifacts_volume = NULL,
+             environment_path = NULL, artifacts_path = NULL,
              last_error = NULL, updated_at = ?
          WHERE company_id = ? AND employee_id = ?",
     )
@@ -636,6 +650,46 @@ pub async fn set_openclaw_runtime_binding(
     .bind(&now)
     .bind(company_id)
     .bind(employee_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub struct AdkRuntimeBindingUpdate<'a> {
+    pub company_id: &'a str,
+    pub employee_id: &'a str,
+    pub runtime_agent_id: &'a str,
+    pub workspace_path: &'a str,
+    pub state_path: &'a str,
+    pub environment_path: &'a str,
+    pub artifacts_path: &'a str,
+}
+
+pub async fn set_adk_runtime_binding(
+    pool: &SqlitePool,
+    update: AdkRuntimeBindingUpdate<'_>,
+) -> Result<(), sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE employee_runtime_bindings
+         SET runtime_type = 'ADK_RUST', runtime_agent_id = ?,
+             runtime_profile_id = 'runtime-profile-adk-rust-01',
+             workspace_path = ?, agent_dir = ?, environment_path = ?, artifacts_path = ?,
+             provision_status = 'READY', runtime_status = 'ACTIVE',
+             container_id = NULL, container_name = NULL, image_ref = NULL,
+             workspace_volume = NULL, state_volume = NULL, artifacts_volume = NULL,
+             last_health_at = ?, last_error = NULL, updated_at = ?
+         WHERE company_id = ? AND employee_id = ?",
+    )
+    .bind(update.runtime_agent_id)
+    .bind(update.workspace_path)
+    .bind(update.state_path)
+    .bind(update.environment_path)
+    .bind(update.artifacts_path)
+    .bind(&now)
+    .bind(&now)
+    .bind(update.company_id)
+    .bind(update.employee_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -2000,6 +2054,8 @@ fn employee_from_row(
                     .runtime_status
                     .clone()
                     .unwrap_or_else(|| "ACTIVE".to_string()),
+                environment_path: row.environment_path.clone(),
+                artifacts_path: row.artifacts_path.clone(),
                 last_health_at: row.last_health_at.clone(),
                 last_error: row.runtime_last_error.clone(),
                 created_at: row.runtime_created_at.clone().unwrap_or_default(),

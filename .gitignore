@@ -2,10 +2,9 @@ node_modules/
 dist/
 .vite/
 coverage/
-apps/server/target/
+**/target/
 apps/server/data/
 *.db
 *.db-shm
 *.db-wal
 .env
-

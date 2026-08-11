@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
-    db,
+    container_runtime, db,
     db::MovementArrival,
     events,
     models::{TerminationPreview, TerminationRecordSummary, TerminationTaskSummary},
@@ -469,6 +469,20 @@ pub async fn start(
         if binding.runtime_type == "OPENCLAW" {
             let session_key = format!("agent:{}:main", binding.runtime_agent_id);
             let runtime_error = openclaw::archive_agent(&binding.runtime_agent_id, &session_key)
+                .await
+                .err()
+                .map(|error| error.to_string());
+            db::update_runtime_binding_status(
+                &state.pool,
+                company_id,
+                employee_id,
+                Some("DISABLED"),
+                Some("ARCHIVED"),
+                runtime_error.as_deref(),
+            )
+            .await?;
+        } else if binding.runtime_type == "ADK_RUST" {
+            let runtime_error = container_runtime::archive_employee(state, company_id, employee_id)
                 .await
                 .err()
                 .map(|error| error.to_string());

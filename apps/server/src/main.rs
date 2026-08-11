@@ -1,6 +1,9 @@
+mod adk_runtime;
 mod api;
 mod app_state;
 mod appearance;
+mod container_engine;
+mod container_runtime;
 mod db;
 mod events;
 mod llm;
@@ -13,6 +16,7 @@ mod office;
 mod openclaw;
 mod organization;
 mod runtime;
+mod runtime_store;
 mod spatial;
 mod spatial_commands;
 mod websocket;
@@ -38,7 +42,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ensure_database_directory(&database_url)?;
     let pool = db::initialize(&database_url).await?;
     let state = AppState::new(pool);
+    if state.container_engine.config().enabled {
+        match state.container_engine.cleanup_stale_containers().await {
+            Ok(count) if count > 0 => {
+                tracing::info!(count, "removed stale AI Company execution containers");
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "could not clean stale execution containers"),
+        }
+    }
     db::recover_running_jobs(&state.pool).await?;
+    let interrupted_runs = runtime_store::recover_interrupted_runs(&state.pool).await?;
+    if interrupted_runs > 0 {
+        tracing::warn!(
+            interrupted_runs,
+            "recovered interrupted employee runtime runs"
+        );
+    }
     runtime::spawn_worker(state.clone());
     movement::spawn_worker(state.clone());
 

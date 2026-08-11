@@ -10,13 +10,14 @@ use serde_json::json;
 
 use crate::{
     app_state::AppState,
-    db, events, llm, model_profiles,
+    container_runtime, db, events, llm, model_profiles,
     models::{
         CompanySnapshot, EmployeeModelProfileInput, EventsQuery, FloorInput, FloorUpdateInput,
         HireCandidateInput, MeetingInput, MessageHistoryQuery, MessageInput, ModelProfileInput,
-        ModelProfileUpdate, MoveAgentInput, TerminationInput, WebSocketQuery, WorkstationInput,
+        ModelProfileUpdate, MoveAgentInput, RuntimeProvisionInput, TerminationInput,
+        WebSocketQuery, WorkstationInput,
     },
-    offboarding, office, openclaw, organization, spatial, websocket,
+    offboarding, office, openclaw, organization, runtime_store, spatial, websocket,
 };
 
 const COMPANY_ID: &str = "company-01";
@@ -40,6 +41,10 @@ pub fn router(state: AppState) -> Router {
             post(test_model_profile),
         )
         .route("/api/openclaw/status", get(openclaw_status))
+        .route(
+            "/api/container-runtime/status",
+            get(container_runtime_status),
+        )
         .route(
             "/api/companies/{company_id}/messages",
             post(post_company_message),
@@ -75,6 +80,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/companies/{company_id}/employees/{employee_id}/runtime/provision",
             post(provision_employee_runtime),
+        )
+        .route(
+            "/api/companies/{company_id}/employees/{employee_id}/runtime/workspace",
+            post(provision_employee_workspace),
         )
         .route("/api/companies/{company_id}/jobs", get(company_jobs))
         .route(
@@ -198,6 +207,9 @@ async fn snapshot(
         server_time: Utc::now().to_rfc3339(),
         recent_events: events::recent(&state.pool, COMPANY_ID).await?,
         openclaw: openclaw::config_status(),
+        container_runtime: state.container_engine.status().await,
+        environment_suggestions: runtime_store::environment_suggestions(&state.pool, COMPANY_ID)
+            .await?,
     }))
 }
 
@@ -259,6 +271,12 @@ async fn openclaw_status() -> Result<Json<crate::models::OpenClawStatus>, ApiErr
     Ok(Json(openclaw::health().await))
 }
 
+async fn container_runtime_status(
+    State(state): State<AppState>,
+) -> Json<crate::models::ContainerRuntimeStatus> {
+    Json(state.container_engine.status().await)
+}
+
 async fn termination_preview(
     State(state): State<AppState>,
     Path((company_id, employee_id)): Path<(String, String)>,
@@ -316,6 +334,15 @@ async fn provision_employee_runtime(
             "only active employees can be provisioned",
         ));
     }
+    if employee
+        .runtime_binding
+        .as_ref()
+        .is_some_and(|binding| binding.runtime_type == "ADK_RUST")
+    {
+        container_runtime::archive_employee(&state, &company_id, &employee_id)
+            .await
+            .map_err(ApiError::from_anyhow)?;
+    }
     let provision = openclaw::provision_employee(&employee)
         .await
         .map_err(ApiError::from_anyhow)?;
@@ -348,6 +375,55 @@ async fn provision_employee_runtime(
         .find(|employee| employee.id == employee_id)
         .ok_or_else(|| ApiError::bad_request("employee disappeared after provisioning"))?;
     Ok(Json(employee))
+}
+
+async fn provision_employee_workspace(
+    State(state): State<AppState>,
+    Path((company_id, employee_id)): Path<(String, String)>,
+    Json(input): Json<RuntimeProvisionInput>,
+) -> Result<Json<crate::models::RuntimeWorkspaceSummary>, ApiError> {
+    if input
+        .runtime_type
+        .as_deref()
+        .is_some_and(|value| !value.eq_ignore_ascii_case("ADK_RUST"))
+    {
+        return Err(ApiError::bad_request(
+            "workspace endpoint only supports ADK_RUST",
+        ));
+    }
+    if let Some(binding) = db::employees(&state.pool, &company_id)
+        .await?
+        .into_iter()
+        .find(|employee| employee.id == employee_id)
+        .and_then(|employee| employee.runtime_binding)
+        .filter(|binding| binding.runtime_type == "OPENCLAW")
+    {
+        let session_key = format!("agent:{}:main", binding.runtime_agent_id);
+        if let Err(error) = openclaw::archive_agent(&binding.runtime_agent_id, &session_key).await {
+            tracing::warn!(%error, employee_id, "cannot archive OpenClaw agent while switching to ADK Rust");
+        }
+    }
+    let workspace = container_runtime::provision_employee(&state, &company_id, &employee_id)
+        .await
+        .map_err(ApiError::from_anyhow)?;
+    events::emit(
+        &state,
+        &company_id,
+        "runtime.workspace.provisioned",
+        Some(&employee_id),
+        None,
+        json!({
+            "employeeId": employee_id,
+            "runtimeType": "ADK_RUST",
+            "hostRootPath": workspace.host_root_path,
+            "workspacePath": workspace.workspace_path,
+            "statePath": workspace.state_path,
+            "environmentPath": workspace.environment_path,
+            "artifactsPath": workspace.artifacts_path
+        }),
+    )
+    .await?;
+    Ok(Json(workspace))
 }
 
 async fn post_company_message(

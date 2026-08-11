@@ -20,6 +20,7 @@ import {
   fetchOpenClawStatus,
   fetchTerminationPreview,
   provisionEmployeeRuntime as provisionEmployeeRuntimeApi,
+  provisionEmployeeWorkspace as provisionEmployeeWorkspaceApi,
   terminateEmployee as terminateEmployeeApi,
   testModelProfile,
   updateFloor as updateFloorApi,
@@ -47,6 +48,7 @@ import {
   type MessageRecord,
   type ModelProfileSummary,
   type OpenClawStatus,
+  type RuntimeEnvironmentSuggestionSummary,
   type TokenUsageSummary,
 } from '../domain/types';
 
@@ -80,6 +82,7 @@ interface CompanyStoreActions {
   terminateEmployee: (employeeId: string, input: TerminationInput) => Promise<void>;
   testOpenClaw: () => Promise<OpenClawStatus>;
   provisionEmployeeRuntime: (employeeId: string) => Promise<void>;
+  provisionEmployeeWorkspace: (employeeId: string) => Promise<void>;
 }
 
 type CompanyStore = CompanyStoreState & CompanyStoreActions;
@@ -281,6 +284,7 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
       let floors = state.bootstrap?.floors ?? [];
       let workstations = state.bootstrap?.workstations ?? [];
       let hiringRequests = state.bootstrap?.hiringRequests ?? [];
+      let environmentSuggestions = state.bootstrap?.environmentSuggestions ?? [];
 
       if (event.type === 'employee.state.changed' && event.actorId && typeof payload.to === 'string') {
         const nextState = normalizeActorState(payload.to);
@@ -448,6 +452,28 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
           ? employees.map((employee) => (employee.id === hiredEmployee.id ? hiredEmployee : employee))
           : [...employees, hiredEmployee];
       }
+      if (event.type === 'runtime.environment.suggested' && event.actorId && Array.isArray(payload.changes)) {
+        const incoming = payload.changes.flatMap((raw, index): RuntimeEnvironmentSuggestionSummary[] => {
+          if (!raw || typeof raw !== 'object') return [];
+          const change = raw as Record<string, unknown>;
+          if (typeof change.ecosystem !== 'string' || typeof change.packageName !== 'string') return [];
+          return [{
+            id: `${event.eventId}-${index}`,
+            companyId: event.companyId,
+            employeeId: event.actorId ?? '',
+            runtimeRunId: event.correlationId,
+            ecosystem: change.ecosystem,
+            packageName: change.packageName,
+            requestedSpec: typeof change.requestedSpec === 'string' ? change.requestedSpec : null,
+            sourceCommand: '',
+            status: 'SUGGESTED',
+            createdAt: event.timestamp,
+            updatedAt: event.timestamp,
+          }];
+        });
+        const existingKeys = new Set(environmentSuggestions.map((item) => `${item.employeeId}:${item.ecosystem}:${item.packageName}`));
+        environmentSuggestions = [...incoming.filter((item) => !existingKeys.has(`${item.employeeId}:${item.ecosystem}:${item.packageName}`)), ...environmentSuggestions];
+      }
 
       const terminationEvents = new Set([
         'EMPLOYEE_TERMINATION_STARTED',
@@ -477,6 +503,7 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
           floors,
           workstations,
           hiringRequests,
+          environmentSuggestions,
           tokenUsage: tokenUsage ?? state.bootstrap.tokenUsage,
           serverTime: event.timestamp,
         }
@@ -812,6 +839,16 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
       });
     } catch (error) {
       set({ error: error instanceof Error ? error.message : 'Unable to provision OpenClaw runtime' });
+      throw error;
+    }
+  },
+
+  provisionEmployeeWorkspace: async (employeeId) => {
+    try {
+      await provisionEmployeeWorkspaceApi(employeeId);
+      await get().loadBootstrap(get().activeFloorId ?? undefined);
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : 'Unable to provision employee workspace' });
       throw error;
     }
   },

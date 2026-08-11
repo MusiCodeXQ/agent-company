@@ -119,8 +119,44 @@ export interface RuntimeBindingSummary {
   agentDir?: string | null;
   provisionStatus: string;
   runtimeStatus: string;
+  environmentPath?: string | null;
+  artifactsPath?: string | null;
   lastHealthAt?: string | null;
   lastError?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ContainerRuntimeStatus {
+  enabled: boolean;
+  available: boolean;
+  engineVersion?: string | null;
+  defaultImage: string;
+  lastError?: string | null;
+}
+
+export interface RuntimeWorkspaceSummary {
+  id: string;
+  companyId: string;
+  employeeId: string;
+  hostRootPath: string;
+  workspacePath: string;
+  statePath: string;
+  artifactsPath: string;
+  environmentPath: string;
+  status: string;
+}
+
+export interface RuntimeEnvironmentSuggestionSummary {
+  id: string;
+  companyId: string;
+  employeeId: string;
+  runtimeRunId?: string | null;
+  ecosystem: string;
+  packageName: string;
+  requestedSpec?: string | null;
+  sourceCommand: string;
+  status: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -540,6 +576,8 @@ export interface CompanySnapshot {
   serverTime: string;
   recentEvents: DomainEvent[];
   openclaw: OpenClawStatus;
+  containerRuntime: ContainerRuntimeStatus;
+  environmentSuggestions: RuntimeEnvironmentSuggestionSummary[];
 }
 
 export type BootstrapResponse = CompanySnapshot;

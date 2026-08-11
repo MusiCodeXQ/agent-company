@@ -138,10 +138,55 @@ pub struct RuntimeBindingSummary {
     pub agent_dir: Option<String>,
     pub provision_status: String,
     pub runtime_status: String,
+    pub environment_path: Option<String>,
+    pub artifacts_path: Option<String>,
     pub last_health_at: Option<String>,
     pub last_error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeWorkspaceSummary {
+    pub id: String,
+    pub company_id: String,
+    pub employee_id: String,
+    pub host_root_path: String,
+    pub workspace_path: String,
+    pub state_path: String,
+    pub artifacts_path: String,
+    pub environment_path: String,
+    pub status: String,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeEnvironmentSuggestionSummary {
+    pub id: String,
+    pub company_id: String,
+    pub employee_id: String,
+    pub runtime_run_id: Option<String>,
+    pub ecosystem: String,
+    pub package_name: String,
+    pub requested_spec: Option<String>,
+    pub source_command: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerRuntimeStatus {
+    pub enabled: bool,
+    pub available: bool,
+    pub engine_version: Option<String>,
+    pub default_image: String,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -469,6 +514,8 @@ pub struct CompanySnapshot {
     pub server_time: String,
     pub recent_events: Vec<DomainEvent>,
     pub openclaw: OpenClawStatus,
+    pub container_runtime: ContainerRuntimeStatus,
+    pub environment_suggestions: Vec<RuntimeEnvironmentSuggestionSummary>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -505,7 +552,13 @@ pub struct EmployeeModelProfileInput {
     pub profile_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeProvisionInput {
+    pub runtime_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeetingInput {
     pub title: Option<String>,
