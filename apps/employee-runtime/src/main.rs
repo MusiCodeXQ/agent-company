@@ -30,6 +30,33 @@ use serde_json::Value;
 const APP_NAME: &str = "ai-company-employee";
 const SESSION_DATABASE_URL: &str = "sqlite:///agent-state/adk-sessions.db?mode=rwc";
 
+const FILE_OPERATION_INSTRUCTIONS: &str = "\
+文件创建和修改规则（必须遵守）：
+- 对 /workspace 中创建的文件（尤其是 Markdown 文档，例如 .md 或 .markdown）必须优先调用 write_file。
+- 修改 /workspace 中已有文件必须先调用 read_file，再调用 edit_file；不要盲目覆盖已有内容。
+- 禁止使用 bash、cat、tee、printf、Shell 重定向（>、>>）、heredoc 或其他 Shell 技巧直接创建或修改 /workspace 中的文件。
+- bash 默认仅用于测试、构建、诊断和检查状态等确实需要 Shell 的操作，不要把它当作 /workspace 的文件编辑工具；受限 Docker 挂载目录的例外规则见下方。
+";
+
+const CONTAINER_RUNTIME_INSTRUCTIONS: &str = "\
+你在一次性 Debian stable-slim 执行容器中工作，容器结束后会被删除。基础镜像不提供 Python、Node.js、Rust、JDK、Gradle 或 Maven。
+项目文件放在 /workspace，Agent 状态放在 /agent-state，交付物放在 /artifacts。$HOME=/home/employee 是宿主机上的个人员工目录，不属于临时容器层。
+工作前阅读 $HOME/.ai-company/RUNTIME_POLICY.md 和 toolchains.json。所有个人工具链必须安装到 $HOME/.local/opt 或 $HOME/.local/share，可执行文件放到 $HOME/.local/bin；Rust 使用 $HOME/.cargo 与 $HOME/.rustup，Gradle/Maven 缓存分别使用 $HOME/.gradle 与 $HOME/.m2。
+Python、Node.js、Rust、JDK、Gradle、Maven 以及未来工具都由你在个人目录中安装、升级、复用和清理。安装或升级后必须调用 company_record_personal_toolchain 登记名称、版本和安装路径。
+不要调用 Docker，不要使用 sudo/apt，不要写容器根文件系统。如果确实缺少系统库，调用 company_recommend_base_image_package 提交基础镜像建议。不要输出 API Key 或凭据。
+";
+
+const SANDBOXED_MOUNT_INSTRUCTIONS: &str = "\
+本次运行由服务端标记为受限 Docker 隔离执行。DevToolset 的 read_file、write_file、edit_file 只绑定 /workspace；对 /workspace 必须遵守上面的文件工具规则。
+如果必须读取或写入 /agent-state、/artifacts、/home/employee（这些目录不由 DevToolset 文件工具暴露），可以使用 bash；但这类命令只能访问以下四个挂载目录及其子路径：/workspace、/agent-state、/artifacts、/home/employee。
+禁止通过 ..、符号链接或其他方式逃逸这些目录，禁止访问或修改挂载目录之外的根文件系统、Docker socket、宿主机路径、凭据或其他员工目录。容器根文件系统为只读并已丢弃高权限。
+";
+
+const UNSANDBOXED_RUNTIME_INSTRUCTIONS: &str = "\
+本次运行未确认 Docker 隔离。DevToolset 的文件工具只绑定 /workspace；不要假设 /agent-state、/artifacts 或 /home/employee 可直接操作。
+bash 调用必须经过人工确认，且仍只应按 Workspace 和治理策略执行测试、构建、诊断等操作；不要使用未经确认的 bash 访问或修改其他路径。
+";
+
 #[derive(Debug, Default)]
 struct GovernancePlugin;
 
@@ -147,6 +174,10 @@ struct RunRequest {
     model: ModelRequest,
     #[serde(default = "default_true")]
     allow_tools: bool,
+    /// The server sets this only for the restricted Docker execution path.
+    /// Missing/false keeps the conservative human-confirmation behavior.
+    #[serde(default, alias = "dockerIsolated")]
+    sandboxed: bool,
     #[serde(default)]
     tool_approval: Option<ToolApprovalRequest>,
 }
@@ -282,14 +313,11 @@ async fn run(
         request.model.base_url,
         request.model.model,
     ))?);
-    let instruction = format!(
-        "{}\n\n你在一次性 Debian stable-slim 执行容器中工作，容器结束后会被删除。基础镜像不提供 Python、Node.js、Rust、JDK、Gradle 或 Maven。\
-         项目文件放在 /workspace，Agent 状态放在 /agent-state，交付物放在 /artifacts。$HOME=/home/employee 是宿主机上的个人员工目录，不属于临时容器层。\
-         工作前阅读 $HOME/.ai-company/RUNTIME_POLICY.md 和 toolchains.json。所有个人工具链必须安装到 $HOME/.local/opt 或 $HOME/.local/share，可执行文件放到 $HOME/.local/bin；Rust 使用 $HOME/.cargo 与 $HOME/.rustup，Gradle/Maven 缓存分别使用 $HOME/.gradle 与 $HOME/.m2。\
-         Python、Node.js、Rust、JDK、Gradle、Maven 以及未来工具都由你在个人目录中安装、升级、复用和清理。安装或升级后必须调用 company_record_personal_toolchain 登记名称、版本和安装路径。\
-         不要调用 Docker，不要使用 sudo/apt，不要写容器根文件系统。如果确实缺少系统库，调用 company_recommend_base_image_package 提交基础镜像建议。不要输出 API Key 或凭据。",
-        request.system_prompt
-    );
+    // The server's explicit request marker is the sole authority for the
+    // reduced-confirmation Docker path. Never infer isolation from a mutable
+    // process environment variable.
+    let sandboxed = request.sandboxed;
+    let instruction = runtime_instruction(&request.system_prompt, sandboxed);
     let mut builder = LlmAgentBuilder::new(safe_identity(&request.employee_id))
         .instruction(instruction)
         .model(model)
@@ -320,9 +348,10 @@ async fn run(
                 "RUSTUP_HOME",
                 "GRADLE_USER_HOME",
             ]);
-        builder = builder
-            .toolset(Arc::new(DevToolset::new(workspace)))
-            .require_tool_confirmation("bash");
+        builder = builder.toolset(Arc::new(DevToolset::new(workspace)));
+        if bash_requires_confirmation(sandboxed) {
+            builder = builder.require_tool_confirmation("bash");
+        }
     }
     let image_package_tool = FunctionTool::new(
         "company_recommend_base_image_package",
@@ -418,7 +447,7 @@ async fn run(
         event_type: "run.started".to_string(),
         tool_name: None,
         call_id: None,
-        arguments: Some(serde_json::json!({ "runId": request.run_id })),
+        arguments: Some(run_started_arguments(&request.run_id, sandboxed)),
         status: Some("RUNNING".to_string()),
         result_summary: None,
         fingerprint: None,
@@ -859,6 +888,23 @@ fn safe_identity(value: &str) -> String {
     }
 }
 
+fn bash_requires_confirmation(sandboxed: bool) -> bool {
+    !sandboxed
+}
+
+fn run_started_arguments(run_id: &str, sandboxed: bool) -> Value {
+    serde_json::json!({ "runId": run_id, "sandboxed": sandboxed })
+}
+
+fn runtime_instruction(system_prompt: &str, sandboxed: bool) -> String {
+    let runtime_context = if sandboxed {
+        format!("{CONTAINER_RUNTIME_INSTRUCTIONS}\n{SANDBOXED_MOUNT_INSTRUCTIONS}")
+    } else {
+        UNSANDBOXED_RUNTIME_INSTRUCTIONS.to_string()
+    };
+    format!("{system_prompt}\n\n{FILE_OPERATION_INSTRUCTIONS}\n{runtime_context}")
+}
+
 fn default_true() -> bool {
     true
 }
@@ -874,9 +920,84 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        PersonalToolchainRecord, environment_changes, record_personal_toolchain_at,
-        redact_arguments, safe_identity,
+        PersonalToolchainRecord, RunRequest, bash_requires_confirmation, environment_changes,
+        record_personal_toolchain_at, redact_arguments, run_started_arguments, runtime_instruction,
+        safe_identity,
     };
+
+    #[test]
+    fn runtime_instruction_requires_file_tools_for_document_changes() {
+        let instruction = runtime_instruction("base task", true);
+        assert!(instruction.contains("base task"));
+        assert!(instruction.contains("write_file"));
+        assert!(instruction.contains("edit_file"));
+        assert!(instruction.contains("Markdown"));
+        assert!(instruction.contains("禁止使用 bash、cat、tee"));
+        assert!(instruction.contains("/workspace、/agent-state、/artifacts、/home/employee"));
+        assert!(
+            instruction
+                .contains("DevToolset 的 read_file、write_file、edit_file 只绑定 /workspace")
+        );
+        assert!(instruction.contains("可以使用 bash；但这类命令只能访问"));
+    }
+
+    #[test]
+    fn unsandboxed_runtime_does_not_claim_other_mounts_are_editable() {
+        let instruction = runtime_instruction("base task", false);
+        assert!(instruction.contains("bash 调用必须经过人工确认"));
+        assert!(
+            instruction.contains("不要假设 /agent-state、/artifacts 或 /home/employee 可直接操作")
+        );
+        assert!(!instruction.contains("可以使用 bash；但这类命令只能访问"));
+    }
+
+    #[test]
+    fn docker_isolation_only_disables_bash_confirmation() {
+        assert!(!bash_requires_confirmation(true));
+        assert!(bash_requires_confirmation(false));
+
+        let request: RunRequest = serde_json::from_value(json!({
+            "companyId": "company-01",
+            "runId": "run-01",
+            "agentJobId": "job-01",
+            "employeeId": "employee-01",
+            "sessionId": "session-01",
+            "systemPrompt": "test",
+            "content": "test",
+            "model": {
+                "protocol": "openai",
+                "baseUrl": "http://localhost",
+                "model": "test"
+            },
+            "dockerIsolated": true
+        }))
+        .expect("docker isolation alias should be accepted");
+        assert!(request.sandboxed);
+
+        let request: RunRequest = serde_json::from_value(json!({
+            "companyId": "company-01",
+            "runId": "run-01",
+            "agentJobId": "job-01",
+            "employeeId": "employee-01",
+            "sessionId": "session-01",
+            "systemPrompt": "test",
+            "content": "test",
+            "model": {
+                "protocol": "openai",
+                "baseUrl": "http://localhost",
+                "model": "test"
+            }
+        }))
+        .expect("sandbox marker should default safely");
+        assert!(!request.sandboxed);
+    }
+
+    #[test]
+    fn run_started_event_includes_sandbox_diagnostic() {
+        let arguments = run_started_arguments("run-01", true);
+        assert_eq!(arguments["runId"], "run-01");
+        assert_eq!(arguments["sandboxed"], true);
+    }
 
     #[test]
     fn extracts_environment_install_suggestions() {

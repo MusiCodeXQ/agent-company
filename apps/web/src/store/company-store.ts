@@ -650,7 +650,11 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
 
   openPhone: async (employeeId) => {
     set({ selectedEmployeeId: employeeId, phoneEmployeeId: employeeId });
-    await Promise.all([get().loadConversation(employeeId), get().markRead(employeeId)]);
+    await Promise.all([
+      get().loadConversation(employeeId),
+      get().markRead(employeeId),
+      get().loadRuntimeToolApprovals(),
+    ]);
   },
 
   closePhone: () => set({ phoneEmployeeId: null }),

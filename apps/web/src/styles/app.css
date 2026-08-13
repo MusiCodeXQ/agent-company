@@ -305,7 +305,7 @@ button { cursor: pointer; }
 .phone-state { width: 7px; height: 7px; margin-left: auto; border-radius: 50%; background: #8290a0; }
 .phone-state.checking_phone, .phone-state.thinking { background: var(--amber); box-shadow: 0 0 8px rgba(246, 200, 95, .8); }
 .phone-state.coding { background: var(--green); box-shadow: 0 0 8px rgba(92, 225, 184, .8); }
-.phone-tabs { display: grid; grid-template-columns: repeat(4, 1fr); margin: 0 5px; padding: 3px; border-radius: 9px; background: #17232e; }
+.phone-tabs { display: grid; grid-template-columns: repeat(5, 1fr); margin: 0 5px; padding: 3px; border-radius: 9px; background: #17232e; }
 .phone-tabs button { position: relative; padding: 8px 2px; border: 0; border-radius: 7px; color: #778c9d; background: transparent; font-size: 12px; }
 .phone-tabs button.active { color: #e6f2f7; background: #2b4050; }
 .phone-tabs sup { position: absolute; top: 4px; right: 5px; min-width: 13px; padding: 1px 3px; border-radius: 8px; color: #18212b; background: var(--amber); font-size: 10px; }
@@ -326,6 +326,17 @@ button { cursor: pointer; }
 .phone-compose button { width: 31px; border: 0; border-radius: 7px; color: #14242a; background: var(--green); font-size: 16px; }
 .phone-compose button:disabled { opacity: .6; }
 .phone-tab-page { height: 100%; padding: 14px; overflow-y: auto; color: #a8b9c5; font-size: 12px; line-height: 1.55; }
+.phone-approval-state { display: grid; min-height: 130px; place-items: center; color: #7f95a3; text-align: center; }
+.phone-approval-list { padding: 11px; }
+.phone-section-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; color: #d4e3ea; font-weight: 700; }
+.phone-section-heading small { color: #8b9da9; font-weight: 500; }
+.phone-approval-card { margin-bottom: 9px; padding: 10px; border: 1px solid rgba(246, 200, 95, .28); border-radius: 8px; background: rgba(65, 49, 28, .42); }
+.phone-approval-card-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: #f5dca7; }
+.phone-approval-card-heading time, .phone-approval-card > small { color: #9c9b8a; font-size: 10px; }
+.phone-approval-card > small { display: block; margin-top: 3px; }
+.phone-approval-card pre { max-height: 105px; overflow: auto; margin: 8px 0; padding: 7px; border-radius: 6px; color: #d4c9ae; background: rgba(8, 13, 18, .58); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+.phone-approval-actions { display: flex; justify-content: flex-end; gap: 7px; }
+.phone-approval-actions .ghost-button, .phone-approval-actions .primary-button { min-height: 28px; margin: 0; padding: 0 9px; font-size: 11px; }
 .phone-fact-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .phone-fact-grid span, .work-card { display: grid; gap: 3px; padding: 9px; border-radius: 7px; color: #718596; background: #172530; }
 .phone-fact-grid strong, .work-card strong { color: #d7e4eb; font-size: 13px; }
@@ -424,6 +435,12 @@ button { cursor: pointer; }
 .system-log-details { margin-top: 8px; border-top: 1px solid rgba(111, 137, 157, .15); padding-top: 7px; }
 .system-log-details summary { width: fit-content; cursor: pointer; color: #8eb7ca; font-size: 11px; }
 .system-log-details pre { max-height: 260px; overflow: auto; margin: 7px 0 0; padding: 10px; border-radius: 7px; color: #c2d1da; background: #0d151d; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.system-logs-pagination { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 16px; color: #9fb2bd; font-size: 12px; }
+.system-logs-pagination .ghost-button { min-width: 66px; min-height: 32px; margin: 0; }
+.system-logs-pagination .ghost-button:disabled { cursor: not-allowed; opacity: .45; }
+.system-logs-pagination label { display: inline-flex; align-items: center; gap: 6px; margin-left: 8px; color: #879ca8; }
+.system-logs-pagination select { padding: 7px 8px; border: 1px solid #334858; border-radius: 7px; color: #d8e5ee; background: #0e161e; font: inherit; font-size: 12px; }
+.system-logs-pagination select:focus { border-color: #72b7ff; outline: none; box-shadow: 0 0 0 3px rgba(114, 183, 255, .08); }
 
 @media (max-width: 1380px) {
   .system-logs-column { padding-left: 22px; padding-right: 22px; }
@@ -431,6 +448,7 @@ button { cursor: pointer; }
   .system-logs-heading p { max-width: none; }
   .system-logs-refresh { margin-left: auto; }
   .logs-exception-toggle { margin-left: 0; }
+  .system-logs-pagination { justify-content: flex-start; flex-wrap: wrap; }
 }
 .floor-switcher {
   display: inline-flex;

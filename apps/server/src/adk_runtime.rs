@@ -28,6 +28,10 @@ struct RunRequest<'a> {
     content: &'a str,
     model: ModelRequest<'a>,
     allow_tools: bool,
+    /// Employee runtime runs are started by the restricted Docker engine. Keep
+    /// this explicit in the wire protocol so a non-container fallback remains
+    /// conservative and continues to require bash confirmation.
+    sandboxed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_approval: Option<ToolApprovalRequest<'a>>,
 }
@@ -191,6 +195,7 @@ pub async fn run_turn(
         // capability authorizes protocol messages, never arbitrary container
         // tools; only ordinary workstation jobs receive DevToolset.
         allow_tools: job.meeting_id.is_none() && job.job_type != "A2A_RESPONSE",
+        sandboxed: state.container_engine.config().enabled,
         tool_approval,
     };
     let input = serde_json::to_vec(&request)?;
@@ -619,4 +624,36 @@ async fn record_llm_call(
 
 fn default_run_status() -> String {
     "COMPLETED".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{ModelRequest, RunRequest};
+
+    #[test]
+    fn runtime_request_serializes_explicit_sandbox_marker() {
+        let request = RunRequest {
+            company_id: "company-01",
+            run_id: "run-01",
+            agent_job_id: "job-01",
+            employee_id: "employee-01",
+            session_id: "session-01",
+            system_prompt: "system",
+            content: "content",
+            model: ModelRequest {
+                protocol: "openai",
+                base_url: "http://localhost",
+                api_key: None,
+                model: "test",
+            },
+            allow_tools: true,
+            sandboxed: true,
+            tool_approval: None,
+        };
+
+        let encoded = serde_json::to_value(request).expect("runtime request should serialize");
+        assert_eq!(encoded["sandboxed"], json!(true));
+    }
 }

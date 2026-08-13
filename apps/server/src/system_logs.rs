@@ -9,6 +9,10 @@ use crate::models::ContainerRuntimeStatus;
 #[derive(Clone, Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemLogsQuery {
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+    /// Legacy alias for page_size. Existing clients can continue sending
+    /// `limit`, but the response is still a bounded page.
     pub limit: Option<u32>,
     pub level: Option<String>,
     pub source: Option<String>,
@@ -39,7 +43,26 @@ pub struct SystemLogEntry {
 pub struct SystemLogsResponse {
     pub entries: Vec<SystemLogEntry>,
     pub container_runtime: ContainerRuntimeStatus,
+    pub page: u32,
+    pub page_size: u32,
+    pub has_more: bool,
 }
+
+#[derive(Clone, Debug)]
+pub struct SystemLogsPage {
+    pub entries: Vec<SystemLogEntry>,
+    pub page: u32,
+    pub page_size: u32,
+    pub has_more: bool,
+}
+
+// Keep the omitted-query behavior compatible with the legacy `limit` contract.
+// New clients should send an explicit pageSize (the web UI uses 50), which is
+// bounded more tightly than the legacy parameter.
+const DEFAULT_PAGE_SIZE: u32 = 100;
+const MAX_PAGE: u32 = 1_000;
+const MAX_PAGE_SIZE: u32 = 100;
+const MAX_LEGACY_PAGE_SIZE: u32 = 500;
 
 pub fn sanitize_container_status(mut status: ContainerRuntimeStatus) -> ContainerRuntimeStatus {
     status.last_error = status.last_error.map(|error| redact_details(&error));
@@ -183,11 +206,11 @@ fn source_query(base: &str, order: &str, employee_filter: bool, predicate: Optio
     statement
 }
 
-pub async fn collect(
+pub async fn collect_page(
     pool: &SqlitePool,
     company_id: &str,
     query: &SystemLogsQuery,
-) -> Result<Vec<SystemLogEntry>, sqlx::Error> {
+) -> Result<SystemLogsPage, sqlx::Error> {
     let employee_names =
         sqlx::query_as::<_, EmployeeNameRow>("SELECT id, name FROM employees WHERE company_id = ?")
             .bind(company_id)
@@ -197,9 +220,13 @@ pub async fn collect(
             .map(|row| (row.id, row.name))
             .collect::<HashMap<_, _>>();
 
-    // Keep a small per-source cushion for the final merge while applying known
-    // level predicates in SQL before this limit.
-    let source_limit = source_limit(query.limit);
+    // Fetch only enough rows from each source to assemble the requested merged
+    // page. SQL predicates run before this bounded fetch; the final merge then
+    // applies the cross-source filters, ordering, de-duplication and page.
+    let page = effective_page(query.page);
+    let page_size = effective_page_size(query);
+    let offset = page_offset(page, page_size);
+    let source_limit = source_limit(offset, page_size);
     let mut entries = Vec::new();
 
     if source_enabled(query, "JOB") {
@@ -384,8 +411,14 @@ pub async fn collect(
             .then_with(|| right.id.cmp(&left.id))
     });
     entries.dedup_by(|left, right| left.id == right.id);
-    entries.truncate(effective_limit(query.limit));
-    Ok(entries)
+    let has_more = page_has_more(page, entries.len(), offset, page_size);
+    let entries = entries.into_iter().skip(offset).take(page_size).collect();
+    Ok(SystemLogsPage {
+        entries,
+        page,
+        page_size: page_size as u32,
+        has_more,
+    })
 }
 
 fn push_if_matches(
@@ -420,12 +453,30 @@ fn push_if_matches(
     entries.push(entry);
 }
 
-fn effective_limit(limit: Option<u32>) -> usize {
-    limit.unwrap_or(100).clamp(1, 500) as usize
+fn effective_page(page: Option<u32>) -> u32 {
+    page.unwrap_or(1).clamp(1, MAX_PAGE)
 }
 
-fn source_limit(limit: Option<u32>) -> i64 {
-    (effective_limit(limit).saturating_mul(4).clamp(100, 2_000)) as i64
+fn effective_page_size(query: &SystemLogsQuery) -> usize {
+    if let Some(page_size) = query.page_size {
+        page_size.clamp(1, MAX_PAGE_SIZE) as usize
+    } else if let Some(limit) = query.limit {
+        limit.clamp(1, MAX_LEGACY_PAGE_SIZE) as usize
+    } else {
+        DEFAULT_PAGE_SIZE as usize
+    }
+}
+
+fn page_offset(page: u32, page_size: usize) -> usize {
+    (page.saturating_sub(1) as usize).saturating_mul(page_size)
+}
+
+fn source_limit(offset: usize, page_size: usize) -> i64 {
+    offset.saturating_add(page_size).saturating_add(1) as i64
+}
+
+fn page_has_more(page: u32, entry_count: usize, offset: usize, page_size: usize) -> bool {
+    page < MAX_PAGE && entry_count > offset.saturating_add(page_size)
 }
 
 fn job_level(status: &str) -> &'static str {
@@ -755,11 +806,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn caps_and_defaults_limit() {
-        assert_eq!(effective_limit(None), 100);
-        assert_eq!(effective_limit(Some(0)), 1);
-        assert_eq!(effective_limit(Some(700)), 500);
-        assert_eq!(source_limit(Some(500)), 2_000);
+    fn caps_and_defaults_pagination() {
+        assert_eq!(effective_page(None), 1);
+        assert_eq!(effective_page(Some(0)), 1);
+        assert_eq!(effective_page(Some(2_000)), MAX_PAGE);
+        assert_eq!(effective_page_size(&SystemLogsQuery::default()), 100);
+        assert_eq!(
+            effective_page_size(&SystemLogsQuery {
+                page_size: Some(700),
+                ..SystemLogsQuery::default()
+            }),
+            100
+        );
+        assert_eq!(
+            effective_page_size(&SystemLogsQuery {
+                limit: Some(25),
+                ..SystemLogsQuery::default()
+            }),
+            25
+        );
+        assert_eq!(
+            effective_page_size(&SystemLogsQuery {
+                limit: Some(500),
+                ..SystemLogsQuery::default()
+            }),
+            500
+        );
+        assert_eq!(
+            effective_page_size(&SystemLogsQuery {
+                page_size: Some(50),
+                limit: Some(500),
+                ..SystemLogsQuery::default()
+            }),
+            50
+        );
+        assert_eq!(source_limit(50, 50), 101);
+        assert!(page_has_more(MAX_PAGE - 1, 101, 0, 100));
+        assert!(!page_has_more(MAX_PAGE, 101, 0, 100));
     }
 
     #[test]
@@ -895,12 +978,27 @@ mod tests {
         .execute(&mut *transaction)
         .await
         .expect("failed job should be inserted");
+        for (id, timestamp) in [
+            ("failed-middle", "2020-01-02T00:00:00Z"),
+            ("failed-newest", "2020-01-03T00:00:00Z"),
+        ] {
+            sqlx::query(
+                "INSERT INTO agent_jobs
+                 (id, company_id, job_type, status, employee_id, error, payload, updated_at)
+                 VALUES (?, 'company-1', 'MESSAGE_RESPONSE', 'FAILED', 'employee-1', 'registry timeout', '{}', ?)",
+            )
+            .bind(id)
+            .bind(timestamp)
+            .execute(&mut *transaction)
+            .await
+            .expect("additional failed job should be inserted");
+        }
         transaction
             .commit()
             .await
             .expect("transaction should commit");
 
-        let entries = collect(
+        let entries = collect_page(
             &pool,
             "company-1",
             &SystemLogsQuery {
@@ -912,15 +1010,17 @@ mod tests {
         )
         .await
         .expect("system logs should aggregate");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, "job:failed-old");
-        assert_eq!(entries[0].level, "ERROR");
+        assert_eq!(entries.entries.len(), 1);
+        assert_eq!(entries.entries[0].id, "job:failed-newest");
+        assert_eq!(entries.entries[0].level, "ERROR");
+        assert!(entries.has_more);
 
-        let exception_entries = collect(
+        let exception_entries = collect_page(
             &pool,
             "company-1",
             &SystemLogsQuery {
-                limit: Some(1),
+                page: Some(1),
+                page_size: Some(1),
                 source: Some("JOB".to_string()),
                 exception_only: true,
                 ..SystemLogsQuery::default()
@@ -928,7 +1028,42 @@ mod tests {
         )
         .await
         .expect("exception-only logs should aggregate");
-        assert_eq!(exception_entries.len(), 1);
-        assert_eq!(exception_entries[0].id, "job:failed-old");
+        assert_eq!(exception_entries.entries.len(), 1);
+        assert_eq!(exception_entries.entries[0].id, "job:failed-newest");
+        assert!(exception_entries.has_more);
+
+        let second_exception_page = collect_page(
+            &pool,
+            "company-1",
+            &SystemLogsQuery {
+                page: Some(2),
+                page_size: Some(1),
+                source: Some("JOB".to_string()),
+                exception_only: true,
+                ..SystemLogsQuery::default()
+            },
+        )
+        .await
+        .expect("second exception page should aggregate");
+        assert_eq!(second_exception_page.entries.len(), 1);
+        assert_eq!(second_exception_page.entries[0].id, "job:failed-middle");
+        assert!(second_exception_page.has_more);
+
+        let third_exception_page = collect_page(
+            &pool,
+            "company-1",
+            &SystemLogsQuery {
+                page: Some(3),
+                page_size: Some(1),
+                source: Some("JOB".to_string()),
+                exception_only: true,
+                ..SystemLogsQuery::default()
+            },
+        )
+        .await
+        .expect("third exception page should aggregate");
+        assert_eq!(third_exception_page.entries.len(), 1);
+        assert_eq!(third_exception_page.entries[0].id, "job:failed-old");
+        assert!(!third_exception_page.has_more);
     }
 }

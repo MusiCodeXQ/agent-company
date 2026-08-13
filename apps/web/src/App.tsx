@@ -229,6 +229,9 @@ export function App(): ReactElement {
               employee={phoneEmployee}
               messages={messages}
               bootstrap={bootstrap}
+              approvals={runtimeApprovals}
+              approvalsLoading={runtimeApprovalsLoading}
+              onDecideApproval={decideRuntimeToolApproval}
               onClose={closePhone}
               onSend={sendAgentMessage}
             />
@@ -732,12 +735,18 @@ function PhonePanel({
   employee,
   messages,
   bootstrap,
+  approvals,
+  approvalsLoading,
+  onDecideApproval,
   onClose,
   onSend,
 }: {
   employee: Employee;
   messages: MessageRecord[];
   bootstrap: AppBootstrap;
+  approvals: RuntimeToolApprovalSummary[];
+  approvalsLoading: boolean;
+  onDecideApproval: (approvalId: string, decision: 'APPROVE' | 'DENY') => Promise<void>;
   onClose: () => void;
   onSend: (employeeId: string, content: string) => Promise<void>;
 }): ReactElement {
@@ -746,7 +755,7 @@ function PhonePanel({
   const memoryRecords = useCompanyStore((state) => state.memories[employee.id]);
   const messageHistory = useCompanyStore((state) => state.messageHistory[employee.id]);
   const memories = memoryRecords ?? EMPTY_MEMORIES;
-  const [tab, setTab] = useState<'messages' | 'profile' | 'work' | 'memory'>('messages');
+  const [tab, setTab] = useState<'messages' | 'profile' | 'work' | 'memory' | 'approvals'>('messages');
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
   const messageListRef = useRef<HTMLDivElement>(null);
@@ -762,6 +771,7 @@ function PhonePanel({
   const task = bootstrap?.tasks.find((item) => item.assigneeId === employee.id);
   const goal = task ? bootstrap?.goals.find((item) => item.id === task.goalId) : undefined;
   const jobs = bootstrap?.jobs.filter((job) => job.employeeId === employee.id).slice(-5).reverse() ?? [];
+  const employeeApprovals = approvals.filter((approval) => approval.employeeId === employee.id);
 
   useEffect(() => {
     if (tab === 'memory') void loadMemory(employee.id);
@@ -807,7 +817,7 @@ function PhonePanel({
         <div className="phone-topbar"><span className="phone-time">09:41</span><strong>{employee.name}</strong><button className="phone-close-button" type="button" onClick={onClose} aria-label="关闭">×</button></div>
         <div className="phone-profile-strip"><span className="phone-avatar" style={{ background: employee.appearance.topColor }}>{employee.name.slice(0, 1)}</span><div><strong>{employee.name}</strong><small>{employee.title} · {STATE_LABELS[employee.currentState]}</small></div><span className={`phone-state ${employee.currentState}`} /></div>
         <div className="phone-tabs">
-          {([['messages', '消息'], ['profile', '资料'], ['work', '工作'], ['memory', '记忆']] as const).map(([value, label]) => <button className={tab === value ? 'active' : ''} type="button" key={value} onClick={() => setTab(value)}>{label}{value === 'messages' && employee.unreadCount > 0 && <sup>{employee.unreadCount}</sup>}</button>)}
+          {([['messages', '消息'], ['profile', '资料'], ['work', '工作'], ['memory', '记忆'], ['approvals', '审批']] as const).map(([value, label]) => <button className={tab === value ? 'active' : ''} type="button" key={value} onClick={() => setTab(value)}>{label}{value === 'messages' && employee.unreadCount > 0 && <sup>{employee.unreadCount}</sup>}{value === 'approvals' && employeeApprovals.length > 0 && <sup>{employeeApprovals.length}</sup>}</button>)}
         </div>
         <div className="phone-content">
           {tab === 'messages' && <div className="phone-messages"><div className="phone-message-list" ref={messageListRef}>
@@ -818,10 +828,51 @@ function PhonePanel({
           {tab === 'profile' && <ProfileTab employee={employee} />}
           {tab === 'work' && <WorkTab employee={employee} goalTitle={goal?.title} task={task?.title} jobs={jobs} />}
           {tab === 'memory' && <MemoryTab memories={memories} />}
+          {tab === 'approvals' && <PhoneApprovalTab approvals={employeeApprovals} loading={approvalsLoading} onDecide={onDecideApproval} />}
         </div>
         <div className="phone-home-indicator" />
       </div>
     </section>
+  );
+}
+
+function PhoneApprovalTab({
+  approvals,
+  loading,
+  onDecide,
+}: {
+  approvals: RuntimeToolApprovalSummary[];
+  loading: boolean;
+  onDecide: (approvalId: string, decision: 'APPROVE' | 'DENY') => Promise<void>;
+}): ReactElement {
+  const [decidingId, setDecidingId] = useState<string | null>(null);
+
+  async function decide(approvalId: string, decision: 'APPROVE' | 'DENY'): Promise<void> {
+    setDecidingId(approvalId);
+    try {
+      await onDecide(approvalId, decision);
+    } finally {
+      setDecidingId(null);
+    }
+  }
+
+  if (loading) return <div className="phone-tab-page phone-approval-state">正在加载待审批工具调用…</div>;
+  if (approvals.length === 0) return <div className="phone-tab-page phone-approval-state">当前员工没有待审批的工具调用。</div>;
+  return (
+    <div className="phone-tab-page phone-approval-list">
+      <div className="phone-section-heading"><span>待处理审批</span><small>{approvals.length} 项</small></div>
+      {approvals.map((approval) => (
+        <article className="phone-approval-card" key={approval.id}>
+          <div className="phone-approval-card-heading"><strong>{approval.toolName}</strong><time>{formatTime(approval.createdAt)}</time></div>
+          <small>调用 {approval.functionCallId}</small>
+          <pre>{approval.argumentsRedacted}</pre>
+          <div className="phone-approval-actions">
+            <button className="ghost-button" type="button" onClick={() => void decide(approval.id, 'DENY')} disabled={decidingId !== null}>拒绝</button>
+            <button className="primary-button" type="button" onClick={() => void decide(approval.id, 'APPROVE')} disabled={decidingId !== null}>{decidingId === approval.id ? '提交中…' : '批准'}</button>
+          </div>
+        </article>
+      ))}
+    </div>
   );
 }
 

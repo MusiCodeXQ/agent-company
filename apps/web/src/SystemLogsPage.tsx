@@ -29,6 +29,9 @@ export function SystemLogsPage({ employees }: { employees: Employee[] }): ReactE
   const [source, setSource] = useState<SourceFilter>('ALL');
   const [employeeId, setEmployeeId] = useState('');
   const [exceptionOnly, setExceptionOnly] = useState(false);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
+  const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -46,7 +49,8 @@ export function SystemLogsPage({ employees }: { employees: Employee[] }): ReactE
     if (showSpinner) setRefreshing(true);
     try {
       const response = await fetchSystemLogs({
-        limit: exceptionOnly ? 500 : 100,
+        page,
+        pageSize,
         level: !exceptionOnly && level !== 'ALL' ? level : undefined,
         source: source !== 'ALL' ? source : undefined,
         employeeId: employeeId || undefined,
@@ -55,6 +59,9 @@ export function SystemLogsPage({ employees }: { employees: Employee[] }): ReactE
       if (controller.signal.aborted || requestSequence !== requestSequenceRef.current) return;
       setEntries(response.entries);
       setContainerRuntime(response.containerRuntime);
+      setPage(response.page);
+      setPageSize(response.pageSize);
+      setHasMore(response.hasMore);
       setError(null);
     } catch (requestError) {
       if (controller.signal.aborted || requestSequence !== requestSequenceRef.current) return;
@@ -68,6 +75,10 @@ export function SystemLogsPage({ employees }: { employees: Employee[] }): ReactE
         setRefreshing(false);
       }
     }
+  }, [employeeId, exceptionOnly, level, page, pageSize, source]);
+
+  useEffect(() => {
+    setPage(1);
   }, [employeeId, exceptionOnly, level, source]);
 
   useEffect(() => {
@@ -90,6 +101,13 @@ export function SystemLogsPage({ employees }: { employees: Employee[] }): ReactE
 
   function toggleExceptionOnly(): void {
     setExceptionOnly((enabled) => !enabled);
+  }
+
+  function changePageSize(value: string): void {
+    const nextPageSize = Number(value);
+    if (!Number.isFinite(nextPageSize)) return;
+    setPageSize(nextPageSize);
+    setPage(1);
   }
 
   return (
@@ -123,6 +141,26 @@ export function SystemLogsPage({ employees }: { employees: Employee[] }): ReactE
         <section className="system-log-list" aria-live="polite">
           {visibleEntries.map((entry) => <SystemLogRow key={entry.id} entry={entry} employeeById={employeeById} />)}
         </section>
+        <nav className="system-logs-pagination" aria-label="系统日志分页">
+          <button
+            className="ghost-button"
+            type="button"
+            onClick={() => setPage((current) => Math.max(1, current - 1))}
+            disabled={page <= 1 || loading}
+            aria-label="上一页日志"
+          >上一页</button>
+          <span aria-live="polite">第 {page} 页{loading ? ' · 加载中…' : ''}</span>
+          <button
+            className="ghost-button"
+            type="button"
+            onClick={() => setPage((current) => current + 1)}
+            disabled={!hasMore || loading}
+            aria-label="下一页日志"
+          >下一页</button>
+          <label>每页<select aria-label="每页日志数量" value={pageSize} onChange={(event) => changePageSize(event.target.value)} disabled={loading}>
+            {[25, 50, 100].map((size) => <option value={size} key={size}>{size}</option>)}
+          </select></label>
+        </nav>
       </div>
     </main>
   );

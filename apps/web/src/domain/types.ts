@@ -155,6 +155,9 @@ export interface SystemLogEntry {
 export interface SystemLogsResponse {
   entries: SystemLogEntry[];
   containerRuntime: ContainerRuntimeStatus;
+  page: number;
+  pageSize: number;
+  hasMore: boolean;
 }
 
 export interface RuntimeWorkspaceSummary {

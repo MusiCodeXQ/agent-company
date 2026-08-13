@@ -308,6 +308,16 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
                         Some("等待用户审批高风险工具调用"),
                     )
                     .await?;
+                    events::transition(
+                        state,
+                        &job.company_id,
+                        &job.employee_id,
+                        "WAITING",
+                        job.task_id.as_deref(),
+                        Some(&job.id),
+                    )
+                    .await
+                    .context("transition employee to WAITING")?;
                     events::emit(
                         state,
                         &job.company_id,

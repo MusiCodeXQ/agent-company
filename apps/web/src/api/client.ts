@@ -361,6 +361,9 @@ export async function fetchCompanyJobs(): Promise<AgentJobSummary[]> {
 }
 
 export interface SystemLogsQuery {
+  page?: number;
+  pageSize?: number;
+  /** Legacy alias retained for older clients. */
   limit?: number;
   level?: string;
   source?: string;
@@ -370,6 +373,8 @@ export interface SystemLogsQuery {
 
 export async function fetchSystemLogs(query: SystemLogsQuery = {}, signal?: AbortSignal): Promise<SystemLogsResponse> {
   const params = new URLSearchParams();
+  if (query.page !== undefined) params.set('page', String(query.page));
+  if (query.pageSize !== undefined) params.set('pageSize', String(query.pageSize));
   if (query.limit !== undefined) params.set('limit', String(query.limit));
   if (query.level) params.set('level', query.level);
   if (query.source) params.set('source', query.source);

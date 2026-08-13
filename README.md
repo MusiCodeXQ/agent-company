@@ -226,6 +226,8 @@ docker build \
   .
 ```
 
+Rebuild and restart the employee image after changing `apps/employee-runtime` or the runtime approval protocol. The running image contains a compiled `employee-runtime` binary and does not automatically receive new runtime protocol fields or approval behavior.
+
 Enable it in `.env`:
 
 ```dotenv

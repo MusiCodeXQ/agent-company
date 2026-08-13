@@ -234,6 +234,8 @@ docker build \
   .
 ```
 
+每次修改 `apps/employee-runtime` 或运行时审批协议后，都必须重新构建并重启使用中的员工镜像；运行中的镜像内置旧版 `employee-runtime`，不会自动获得新的运行时协议字段和审批策略。
+
 在 `.env` 中启用：
 
 ```dotenv

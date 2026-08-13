@@ -671,12 +671,15 @@ async fn company_system_logs(
     Path(company_id): Path<String>,
     Query(query): Query<system_logs::SystemLogsQuery>,
 ) -> Result<Json<system_logs::SystemLogsResponse>, ApiError> {
-    let entries = system_logs::collect(&state.pool, &company_id, &query).await?;
+    let page = system_logs::collect_page(&state.pool, &company_id, &query).await?;
     Ok(Json(system_logs::SystemLogsResponse {
-        entries,
+        entries: page.entries,
         container_runtime: system_logs::sanitize_container_status(
             state.container_engine.status().await,
         ),
+        page: page.page,
+        page_size: page.page_size,
+        has_more: page.has_more,
     }))
 }
 
