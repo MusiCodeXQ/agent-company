@@ -1,6 +1,8 @@
 import type {
   AgentMemoryRecord,
   AgentJobSummary,
+  A2aCommunicationDetail,
+  A2aFaceToFaceSession,
   CompanySnapshot,
   DomainEvent,
   FloorSummary,
@@ -9,6 +11,8 @@ import type {
   ModelProfileSummary,
   OpenClawStatus,
   RuntimeWorkspaceSummary,
+  RuntimeToolApprovalSummary,
+  SystemLogsResponse,
   Employee,
   MeetingSummary,
   TerminationPreview,
@@ -313,10 +317,68 @@ export async function fetchEmployeeMemory(employeeId: string): Promise<AgentMemo
   return response.json() as Promise<AgentMemoryRecord[]>;
 }
 
+export async function fetchA2aCommunications(
+  before?: string,
+  limit = 40,
+): Promise<A2aFaceToFaceSession[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (before) params.set('before', before);
+  const response = await fetch(`/api/companies/${COMPANY_ID}/a2a/communications?${params.toString()}`);
+  if (!response.ok) throw await readError(response, 'A2A communication request failed');
+  return response.json() as Promise<A2aFaceToFaceSession[]>;
+}
+
+export async function fetchA2aCommunication(sessionId: string): Promise<A2aCommunicationDetail> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/a2a/communications/${encodeURIComponent(sessionId)}`);
+  if (!response.ok) throw await readError(response, 'A2A communication detail request failed');
+  return response.json() as Promise<A2aCommunicationDetail>;
+}
+
+export async function fetchRuntimeToolApprovals(): Promise<RuntimeToolApprovalSummary[]> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/runtime/approvals`);
+  if (!response.ok) throw await readError(response, 'Runtime approval request failed');
+  return response.json() as Promise<RuntimeToolApprovalSummary[]>;
+}
+
+export async function decideRuntimeToolApproval(
+  approvalId: string,
+  decision: 'APPROVE' | 'DENY',
+  reason?: string,
+): Promise<RuntimeToolApprovalSummary> {
+  const response = await fetch(`/api/companies/${COMPANY_ID}/runtime/approvals/${encodeURIComponent(approvalId)}/decision`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ decision, reason }),
+  });
+  if (!response.ok) throw await readError(response, 'Runtime approval decision failed');
+  return response.json() as Promise<RuntimeToolApprovalSummary>;
+}
+
 export async function fetchCompanyJobs(): Promise<AgentJobSummary[]> {
   const response = await fetch(`/api/companies/${COMPANY_ID}/jobs`);
   if (!response.ok) throw await readError(response, 'Job request failed');
   return response.json() as Promise<AgentJobSummary[]>;
+}
+
+export interface SystemLogsQuery {
+  limit?: number;
+  level?: string;
+  source?: string;
+  employeeId?: string;
+  exceptionOnly?: boolean;
+}
+
+export async function fetchSystemLogs(query: SystemLogsQuery = {}, signal?: AbortSignal): Promise<SystemLogsResponse> {
+  const params = new URLSearchParams();
+  if (query.limit !== undefined) params.set('limit', String(query.limit));
+  if (query.level) params.set('level', query.level);
+  if (query.source) params.set('source', query.source);
+  if (query.employeeId) params.set('employeeId', query.employeeId);
+  if (query.exceptionOnly) params.set('exceptionOnly', 'true');
+  const queryString = params.toString();
+  const response = await fetch(`/api/companies/${COMPANY_ID}/system-logs${queryString ? `?${queryString}` : ''}`, { signal });
+  if (!response.ok) throw await readError(response, 'System log request failed');
+  return response.json() as Promise<SystemLogsResponse>;
 }
 
 export async function createMeeting(input: MeetingInput): Promise<MeetingSummary> {

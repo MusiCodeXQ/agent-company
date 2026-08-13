@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 
 use crate::{
-    adk_runtime,
+    a2a, adk_runtime,
     app_state::AppState,
     db::{self, AgentJob},
     events,
@@ -61,6 +61,7 @@ async fn process_job(state: &AppState, job: AgentJob) -> Result<()> {
     emit_job_state(state, &job, "RUNNING").await?;
     match job.job_type.as_str() {
         "MESSAGE_RESPONSE" => process_message_job(state, &job).await,
+        "A2A_RESPONSE" => a2a::process_job(state, &job).await,
         other => {
             db::finish_job(
                 &state.pool,
@@ -207,18 +208,7 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
             )
             .await
             {
-                Ok(created) => {
-                    events::emit(
-                        state,
-                        &job.company_id,
-                        "hiring.request.created",
-                        Some(&job.employee_id),
-                        Some(&job.id),
-                        json!({ "request": created.request.clone(), "floorId": created.floor_id.clone() }),
-                    )
-                    .await?;
-                    Some(created)
-                }
+                Ok(created) => Some(created),
                 Err(error) => {
                     tracing::warn!(%error, job_id = %job.id, "administrator message did not produce a structured hiring request");
                     None
@@ -230,9 +220,32 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
     } else {
         None
     };
+    let mut hiring_generation: Option<organization::HiringPersonalizationResult> = None;
     if let Some(created) = hiring_request.as_mut() {
-        if let Err(error) = personalize_hiring_candidates(state, job, &employee, created).await {
-            tracing::warn!(%error, job_id = %job.id, "administrator model candidate generation failed; keeping local fallback candidates");
+        match organization::personalize_hiring_candidates(
+            &state.pool,
+            &job.company_id,
+            &created.request.id,
+            Some(&employee.id),
+            Some(&job.id),
+        )
+        .await
+        {
+            Ok(generation) => {
+                created.request = generation.request.clone();
+                hiring_generation = Some(generation);
+            }
+            Err(_error) => {
+                tracing::warn!(
+                    job_id = %job.id,
+                    fallback_reason = organization::FALLBACK_GENERATION_SERVICE_UNAVAILABLE,
+                    "administrator model candidate generation failed; keeping local fallback candidates"
+                );
+                hiring_generation = Some(organization::HiringPersonalizationResult::fallback(
+                    created.request.clone(),
+                    organization::FALLBACK_GENERATION_SERVICE_UNAVAILABLE,
+                ));
+            }
         }
     }
     let requires_workstation = !command_mode
@@ -286,6 +299,30 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
         } else {
             let result = generate_reply(state, job).await;
             match result {
+                Ok(reply) if reply.starts_with("__AI_COMPANY_WAITING_APPROVAL__:") => {
+                    db::finish_job(
+                        &state.pool,
+                        &job.id,
+                        "WAITING",
+                        None,
+                        Some("等待用户审批高风险工具调用"),
+                    )
+                    .await?;
+                    events::emit(
+                        state,
+                        &job.company_id,
+                        "runtime.approval.required",
+                        Some(&job.employee_id),
+                        Some(&job.id),
+                        json!({
+                            "jobId": job.id,
+                            "approvalId": reply.trim_start_matches("__AI_COMPANY_WAITING_APPROVAL__:")
+                        }),
+                    )
+                    .await?;
+                    emit_job_state(state, job, "WAITING").await?;
+                    return Ok(());
+                }
                 Ok(reply) => reply,
                 Err(error) => {
                     let _ = events::transition(
@@ -329,6 +366,26 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
     };
     let reply = message.content.clone();
     if let Some(created) = hiring_request {
+        let generation = hiring_generation.unwrap_or_else(|| {
+            organization::HiringPersonalizationResult::mock(created.request.clone())
+        });
+        let payload = json!({
+            "request": generation.request,
+            "floorId": created.floor_id,
+            "generationMode": generation.generation_mode,
+            "fallbackReason": generation.fallback_reason,
+        });
+        if !hiring_was_refreshed {
+            events::emit(
+                state,
+                &job.company_id,
+                "hiring.request.created",
+                Some(&job.employee_id),
+                Some(&job.id),
+                payload.clone(),
+            )
+            .await?;
+        }
         events::emit(
             state,
             &job.company_id,
@@ -339,7 +396,7 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
             },
             Some(&job.employee_id),
             Some(&job.id),
-            json!({ "request": created.request, "floorId": created.floor_id }),
+            payload,
         )
         .await?;
     }
@@ -430,61 +487,6 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
     Ok(())
 }
 
-async fn personalize_hiring_candidates(
-    state: &AppState,
-    job: &AgentJob,
-    employee: &crate::models::Employee,
-    created: &mut organization::HiringCreation,
-) -> Result<()> {
-    let Some(profile_id) = employee.model_profile_id.as_deref() else {
-        return Ok(());
-    };
-    let profile = model_profiles::get_credentials(&state.pool, profile_id).await?;
-    if profile.protocol.eq_ignore_ascii_case("mock") {
-        return Ok(());
-    }
-    let candidate_template = serde_json::to_string(&created.request.candidates)?;
-    let system_prompt = "你是虚拟公司的楼层管理员，负责招聘。请根据招聘需求独立设计候选人的姓名、年龄、性别、职位、性格、技能、工作方式和外观。必须只返回 JSON 对象 {\"candidates\":[...]}，保留每个候选人的 id；字段必须完整并沿用输入 JSON 的 camelCase 结构。skills.level、性格五维和 matchScore 范围为 0..100，appearance 必须保留完整字段。招聘评分只能依据岗位、技能、性格与工作方式，严禁依据年龄、性别或外观评分。";
-    let user_prompt = format!(
-        "招聘需求：{}\n请重写以下候选人模板，每个岗位严格保留三位候选人：\n{}",
-        created.request.summary, candidate_template
-    );
-    let started = Instant::now();
-    let response = llm::chat(
-        &profile,
-        system_prompt,
-        &[ChatMessage {
-            role: "user".to_string(),
-            content: user_prompt,
-        }],
-    )
-    .await?;
-    let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-    db::record_llm_call(
-        &state.pool,
-        db::LlmCallInput {
-            company_id: &job.company_id,
-            employee_id: &job.employee_id,
-            job_id: &job.id,
-            model_profile_id: profile_id,
-            model: &profile.model,
-            status: "COMPLETED",
-            usage: &response.usage,
-            latency_ms,
-            error: None,
-        },
-    )
-    .await?;
-    created.request = organization::apply_ai_candidate_profiles(
-        &state.pool,
-        &job.company_id,
-        &created.request.id,
-        &response.content,
-    )
-    .await?;
-    Ok(())
-}
-
 async fn wait_until_arrived(
     state: &AppState,
     company_id: &str,
@@ -512,7 +514,7 @@ async fn wait_until_arrived(
     }
 }
 
-async fn generate_reply(state: &AppState, job: &AgentJob) -> Result<String> {
+pub(crate) async fn generate_reply(state: &AppState, job: &AgentJob) -> Result<String> {
     let employee = db::employees(&state.pool, &job.company_id)
         .await?
         .into_iter()
@@ -523,8 +525,17 @@ async fn generate_reply(state: &AppState, job: &AgentJob) -> Result<String> {
         .as_deref()
         .ok_or_else(|| anyhow!("employee {} has no model profile", employee.id))?;
     let profile = model_profiles::get_credentials(&state.pool, profile_id).await?;
-    let history = db::messages_for_employee(&state.pool, &job.company_id, &job.employee_id).await?;
-    let messages = history
+    let a2a_payload = serde_json::from_str::<serde_json::Value>(&job.payload).ok();
+    let a2a_sender = a2a_payload
+        .as_ref()
+        .and_then(|value| value.get("senderId"))
+        .and_then(serde_json::Value::as_str);
+    let history = if a2a_sender.is_some() {
+        Vec::new()
+    } else {
+        db::messages_for_employee(&state.pool, &job.company_id, &job.employee_id).await?
+    };
+    let mut messages = history
         .into_iter()
         .map(|message| ChatMessage {
             role: if message.from_type == "user" {
@@ -535,13 +546,33 @@ async fn generate_reply(state: &AppState, job: &AgentJob) -> Result<String> {
             content: message.content,
         })
         .collect::<Vec<_>>();
-    let system_prompt = if job.meeting_id.is_some() {
+    if a2a_sender.is_some() {
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: job_message_content(job),
+        });
+    }
+    let voice_profile = format!(
+        "性格：{}。\n沟通风格：{}。\n决策风格：{}。\n说话习惯：{}。\n行为习惯：{}。\n工作方式：{}。\n这些特征只影响措辞、关注点和主动程度，不能降低事实准确性或偏离岗位职责，也不能替代系统的移动与环境规则。",
+        employee.personality.traits.join("、"),
+        employee.personality.communication_style,
+        employee.personality.decision_style,
+        employee.personality.speech_habits.join("；"),
+        employee.personality.behavior_habits.join("；"),
+        employee.work_style
+    );
+    let system_prompt = if let Some(sender_id) = a2a_sender {
         format!(
-            "你是星河软件公司的 Agent。姓名：{}；职位：{}；部门：{}。\n性格：{}。\n技能：{}。\n你正在会议桌旁参加一场跨职能会议，CEO 刚刚向所有当前到席 Agent 广播了一条消息。请只从自己的职能判断：如果目标、范围、约束、优先级或验收标准中有会阻碍你执行的关键不确定性，就提出 1 到 2 个具体澄清问题；如果信息已经足够，或你没有需要追问的内容，必须严格只输出 NO_REPLY。不要泛泛确认，不要替 CEO 做隐藏思考，也不要把问题局限于软件开发。",
+            "你是星河软件公司的 Agent。姓名：{}；职位：{}；部门：{}。\n{}\n你正与员工 {} 在会议室面对面进行受治理的 A2A 对话。请保持上述个人说话风格，直接回答对方，只输出可发送的自然语言内容，不暴露隐藏思考过程。",
+            employee.name, employee.title, employee.department, voice_profile, sender_id
+        )
+    } else if job.meeting_id.is_some() {
+        format!(
+            "你是星河软件公司的 Agent。姓名：{}；职位：{}；部门：{}。\n{}\n技能：{}。\n你正在会议桌旁参加一场跨职能会议，CEO 刚刚向所有当前到席 Agent 广播了一条消息。请只从自己的职能判断：如果目标、范围、约束、优先级或验收标准中有会阻碍你执行的关键不确定性，就用上述个人说话风格提出 1 到 2 个具体澄清问题；如果信息已经足够，或你没有需要追问的内容，必须严格只输出 NO_REPLY。不要泛泛确认，不要替 CEO 做隐藏思考，也不要把问题局限于软件开发。",
             employee.name,
             employee.title,
             employee.department,
-            employee.personality.traits.join("、"),
+            voice_profile,
             employee
                 .skills
                 .iter()
@@ -551,11 +582,11 @@ async fn generate_reply(state: &AppState, job: &AgentJob) -> Result<String> {
         )
     } else {
         format!(
-            "你是星河软件公司的 Agent。姓名：{}；职位：{}；部门：{}。\n性格：{}。\n技能：{}。\n请只输出可直接发给 CEO 的简洁工作回复，不要暴露隐藏思考过程。",
+            "你是星河软件公司的 Agent。姓名：{}；职位：{}；部门：{}。\n{}\n技能：{}。\n请保持上述个人说话风格，只输出可直接发给 CEO 的简洁工作回复，不要暴露隐藏思考过程。",
         employee.name,
         employee.title,
         employee.department,
-        employee.personality.traits.join("、"),
+        voice_profile,
         employee
             .skills
             .iter()
@@ -621,7 +652,7 @@ async fn generate_reply(state: &AppState, job: &AgentJob) -> Result<String> {
                     db::LlmCallInput {
                         company_id: &job.company_id,
                         employee_id: &job.employee_id,
-                        job_id: &job.id,
+                        job_id: Some(&job.id),
                         model_profile_id: profile_id,
                         model: &profile.model,
                         status: "COMPLETED",
@@ -680,7 +711,7 @@ async fn generate_reply(state: &AppState, job: &AgentJob) -> Result<String> {
                 db::LlmCallInput {
                     company_id: &job.company_id,
                     employee_id: &job.employee_id,
-                    job_id: &job.id,
+                    job_id: Some(&job.id),
                     model_profile_id: profile_id,
                     model: &profile.model,
                     status: "COMPLETED",
@@ -732,7 +763,7 @@ async fn generate_reply(state: &AppState, job: &AgentJob) -> Result<String> {
                 db::LlmCallInput {
                     company_id: &job.company_id,
                     employee_id: &job.employee_id,
-                    job_id: &job.id,
+                    job_id: Some(&job.id),
                     model_profile_id: profile_id,
                     model: &profile.model,
                     status: "FAILED",

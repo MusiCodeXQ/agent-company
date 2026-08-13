@@ -1,3 +1,4 @@
+mod a2a;
 mod adk_runtime;
 mod api;
 mod app_state;
@@ -19,6 +20,7 @@ mod runtime;
 mod runtime_store;
 mod spatial;
 mod spatial_commands;
+mod system_logs;
 mod websocket;
 
 use std::{env, path::Path};
@@ -42,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ensure_database_directory(&database_url)?;
     let pool = db::initialize(&database_url).await?;
     organization::ensure_company_administrator(&pool).await?;
+    db::repair_default_runtime_task_assignee(&pool, "company-01").await?;
     let state = AppState::new(pool);
     if state.container_engine.config().enabled {
         match state.container_engine.cleanup_stale_containers().await {

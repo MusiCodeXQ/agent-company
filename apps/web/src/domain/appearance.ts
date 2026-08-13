@@ -23,7 +23,16 @@ class SeededRng {
 
 export function createAppearance(seed: number, gender: Gender, age: number): AppearanceProfile {
   const rng = new SeededRng(seed);
-  const hairStyles = age >= 32 ? ['short', 'side_part', 'bob', 'wave'] : ['short', 'side_part', 'bob', 'wave', 'curly'];
+  const hairStyles = gender === 'female'
+    ? (age >= 32 ? ['bob', 'wave', 'side_part', 'bob'] : ['bob', 'wave', 'curly', 'side_part', 'wave'])
+    : gender === 'male'
+      ? (age >= 32 ? ['short', 'side_part', 'short', 'side_part'] : ['short', 'side_part', 'curly', 'short'])
+      : ['short', 'side_part', 'bob', 'wave', 'curly'];
+  const bottomStyles = gender === 'female'
+    ? ['trousers', 'jeans', 'skirt', 'trousers']
+    : gender === 'male'
+      ? ['trousers', 'jeans', 'trousers', 'jeans']
+      : ['trousers', 'jeans', 'skirt'];
   const beardStyle = gender === 'male' && age >= 30 && rng.next() % 100 < 36
     ? rng.pick(['short', 'neat', 'stubble'])
     : undefined;
@@ -35,7 +44,7 @@ export function createAppearance(seed: number, gender: Gender, age: number): App
     hairColor: rng.pick(['#241A17', '#3A2821', '#5A3928', '#1B2430', '#7B4F35']),
     topStyle: rng.pick(['shirt', 'hoodie', 'sweater', 'jacket']),
     topColor: rng.pick(['#3E5C76', '#6B4E71', '#2E7866', '#C2704B', '#556B8A', '#9A6B3F']),
-    bottomStyle: rng.pick(['trousers', 'jeans', 'skirt']),
+    bottomStyle: rng.pick(bottomStyles),
     bottomColor: rng.pick(['#26364A', '#39424E', '#5A4038', '#2C514B', '#6E5D45']),
     shoeColor: rng.pick(['#1D2026', '#F2EEE8', '#A35D3B', '#334B64']),
     bodyType: rng.pick(['slim', 'regular', 'broad']),
@@ -45,4 +54,3 @@ export function createAppearance(seed: number, gender: Gender, age: number): App
     accessory: rng.pick(['watch', 'headphones', 'badge', 'none']),
   };
 }
-

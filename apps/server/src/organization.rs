@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Instant};
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -8,6 +8,8 @@ use uuid::Uuid;
 
 use crate::{
     appearance::create_appearance,
+    llm::{self, ChatMessage},
+    model_profiles,
     models::{
         CandidateSummary, Employee, FloorRoleSummary, FloorSummary, HiringPositionSummary,
         HiringRequestSummary, PersonalityProfile, SkillProfile, WorkstationSummary,
@@ -19,6 +21,38 @@ use crate::{
 pub struct HiringCreation {
     pub request: HiringRequestSummary,
     pub floor_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct HiringPersonalizationResult {
+    pub request: HiringRequestSummary,
+    pub generation_mode: String,
+    pub fallback_reason: Option<String>,
+}
+
+pub(crate) const FALLBACK_ADMINISTRATOR_UNAVAILABLE: &str = "administrator_unavailable";
+pub(crate) const FALLBACK_MODEL_CONFIG_UNAVAILABLE: &str = "administrator_model_config_unavailable";
+pub(crate) const FALLBACK_MODEL_REQUEST_FAILED: &str = "administrator_model_request_failed";
+pub(crate) const FALLBACK_USAGE_RECORD_FAILED: &str = "administrator_model_usage_record_failed";
+pub(crate) const FALLBACK_MODEL_OUTPUT_INVALID: &str = "administrator_model_output_invalid";
+pub(crate) const FALLBACK_GENERATION_SERVICE_UNAVAILABLE: &str = "generation_service_unavailable";
+
+impl HiringPersonalizationResult {
+    pub fn mock(request: HiringRequestSummary) -> Self {
+        Self {
+            request,
+            generation_mode: "mock".to_string(),
+            fallback_reason: None,
+        }
+    }
+
+    pub fn fallback(request: HiringRequestSummary, reason: &str) -> Self {
+        Self {
+            request,
+            generation_mode: "mock_fallback".to_string(),
+            fallback_reason: Some(reason.to_string()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -745,6 +779,199 @@ pub async fn refresh_candidates(
         .ok_or_else(|| anyhow!("hiring request disappeared after refresh"))
 }
 
+/// Generate the final candidate profiles through the company administrator's
+/// configured model. Both the chat-triggered flow and the HTTP refresh flow
+/// call this function so Mock and real-model behavior cannot drift apart.
+///
+/// `job_id` is supplied by the background worker when the request came from a
+/// persisted Agent job. HTTP refreshes intentionally leave it empty because
+/// `llm_calls.job_id` is nullable; the call is still attributed to the active
+/// administrator and its model profile.
+pub async fn personalize_hiring_candidates(
+    pool: &sqlx::SqlitePool,
+    company_id: &str,
+    request_id: &str,
+    preferred_administrator_id: Option<&str>,
+    job_id: Option<&str>,
+) -> Result<HiringPersonalizationResult> {
+    let request = hiring_requests(pool, company_id)
+        .await?
+        .into_iter()
+        .find(|request| request.id == request_id)
+        .ok_or_else(|| anyhow!("hiring request was not found"))?;
+    let administrator = match active_company_administrator(
+        pool,
+        company_id,
+        preferred_administrator_id.or(request.requester_id.as_deref()),
+    )
+    .await
+    {
+        Ok(administrator) => administrator,
+        Err(_error) => {
+            tracing::warn!(
+                request_id,
+                fallback_reason = FALLBACK_ADMINISTRATOR_UNAVAILABLE,
+                "administrator model candidate personalization fell back to deterministic candidates"
+            );
+            return Ok(HiringPersonalizationResult::fallback(
+                request,
+                FALLBACK_ADMINISTRATOR_UNAVAILABLE,
+            ));
+        }
+    };
+    let Some(profile_id) = administrator.model_profile_id.as_deref() else {
+        return Ok(HiringPersonalizationResult::mock(request));
+    };
+    let profile = match model_profiles::get_credentials(pool, profile_id).await {
+        Ok(profile) => profile,
+        Err(_error) => {
+            tracing::warn!(
+                request_id,
+                fallback_reason = FALLBACK_MODEL_CONFIG_UNAVAILABLE,
+                "administrator model candidate personalization fell back to deterministic candidates"
+            );
+            return Ok(HiringPersonalizationResult::fallback(
+                request,
+                FALLBACK_MODEL_CONFIG_UNAVAILABLE,
+            ));
+        }
+    };
+    if profile.protocol.eq_ignore_ascii_case("mock") {
+        return Ok(HiringPersonalizationResult::mock(request));
+    }
+
+    let available_candidates = request
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.status == "AVAILABLE")
+        .collect::<Vec<_>>();
+    let candidate_template = serde_json::to_string(&available_candidates)?;
+    let system_prompt = hiring_personalization_system_prompt();
+    let user_prompt = format!(
+        "招聘需求：{}\n请重写以下候选人模板，每个岗位严格保留三位候选人：\n{}",
+        request.summary, candidate_template
+    );
+    let started = Instant::now();
+    let response = match llm::chat(
+        &profile,
+        system_prompt,
+        &[ChatMessage {
+            role: "user".to_string(),
+            content: user_prompt,
+        }],
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(_error) => {
+            let fallback_reason = FALLBACK_MODEL_REQUEST_FAILED;
+            let empty_usage = crate::models::TokenUsageSummary::default();
+            if let Err(record_error) = crate::db::record_llm_call(
+                pool,
+                crate::db::LlmCallInput {
+                    company_id,
+                    employee_id: &administrator.id,
+                    job_id,
+                    model_profile_id: profile_id,
+                    model: &profile.model,
+                    status: "FAILED",
+                    usage: &empty_usage,
+                    latency_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                    error: Some(fallback_reason),
+                },
+            )
+            .await
+            {
+                tracing::warn!(
+                    request_id,
+                    ?record_error,
+                    "unable to persist failed hiring personalization usage"
+                );
+            }
+            tracing::warn!(
+                request_id,
+                fallback_reason,
+                "administrator model candidate personalization fell back to deterministic candidates"
+            );
+            return Ok(HiringPersonalizationResult::fallback(
+                request,
+                fallback_reason,
+            ));
+        }
+    };
+    let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+    if let Err(record_error) = crate::db::record_llm_call(
+        pool,
+        crate::db::LlmCallInput {
+            company_id,
+            employee_id: &administrator.id,
+            job_id,
+            model_profile_id: profile_id,
+            model: &profile.model,
+            status: "COMPLETED",
+            usage: &response.usage,
+            latency_ms,
+            error: None,
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            request_id,
+            ?record_error,
+            fallback_reason = FALLBACK_USAGE_RECORD_FAILED,
+            "administrator model candidate personalization fell back to deterministic candidates"
+        );
+        return Ok(HiringPersonalizationResult::fallback(
+            request,
+            FALLBACK_USAGE_RECORD_FAILED,
+        ));
+    }
+    match apply_ai_candidate_profiles(pool, company_id, request_id, &response.content).await {
+        Ok(request) => Ok(HiringPersonalizationResult {
+            request,
+            generation_mode: "ai".to_string(),
+            fallback_reason: None,
+        }),
+        Err(_error) => {
+            tracing::warn!(
+                request_id,
+                fallback_reason = FALLBACK_MODEL_OUTPUT_INVALID,
+                "administrator model candidate personalization fell back to deterministic candidates"
+            );
+            Ok(HiringPersonalizationResult::fallback(
+                request,
+                FALLBACK_MODEL_OUTPUT_INVALID,
+            ))
+        }
+    }
+}
+
+pub fn hiring_personalization_system_prompt() -> &'static str {
+    "你是虚拟公司的楼层管理员，负责招聘。请根据招聘需求独立设计候选人的姓名、年龄、性别、职位、性格、技能、工作方式和外观。必须只返回 JSON 对象 {\"candidates\":[...]}，保留每个候选人的 id；字段必须完整并沿用输入 JSON 的 camelCase 结构。每个 personality 必须包含 openness、conscientiousness、extraversion、agreeableness、emotionalStability（均为 0..100）、traits（至少一项）、communicationStyle、decisionStyle、speechHabits（至少一项）和 behaviorHabits（至少一项）；workStyle、strengths、weaknesses、expertise 也必须提供。gender 只能是 male、female 或 non_binary，age 必须是 18..75 的整数，skills.level 和 matchScore 范围为 0..100，appearance 必须保留完整字段。招聘评分只能依据岗位、技能、经验、沟通表现、性格和工作方式，严禁依据年龄、性别或任何 appearance 字段评分。"
+}
+
+async fn active_company_administrator(
+    pool: &sqlx::SqlitePool,
+    company_id: &str,
+    preferred_id: Option<&str>,
+) -> Result<Employee> {
+    let employees = crate::db::employees(pool, company_id).await?;
+    if let Some(preferred_id) = preferred_id {
+        if let Some(employee) = employees.iter().find(|employee| {
+            employee.id == preferred_id
+                && employee.is_floor_administrator
+                && employee.employment_status == "ACTIVE"
+        }) {
+            return Ok(employee.clone());
+        }
+    }
+    employees
+        .into_iter()
+        .find(|employee| employee.is_floor_administrator && employee.employment_status == "ACTIVE")
+        .ok_or_else(|| anyhow!("company has no active administrator"))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AiCandidateSet {
@@ -803,22 +1030,24 @@ pub async fn apply_ai_candidate_profiles(
                 "model returned an unknown or duplicate candidate id"
             ));
         }
-        if !(18..=75).contains(&candidate.age)
-            || candidate.name.trim().is_empty()
-            || candidate.title.trim().is_empty()
-            || candidate.skills.is_empty()
-            || candidate.skills.len() > 12
-            || candidate.match_score.clamp(0, 100) != candidate.match_score
-        {
-            return Err(anyhow!("model returned invalid candidate fields"));
-        }
-        if candidate
-            .skills
+        validate_ai_candidate_profile(&candidate)?;
+        let seed = request
+            .candidates
             .iter()
-            .any(|skill| skill.name.trim().is_empty() || skill.level > 100)
-        {
-            return Err(anyhow!("model returned invalid candidate skills"));
-        }
+            .find(|existing| existing.id == candidate.id)
+            .map(|existing| existing.appearance.seed)
+            .ok_or_else(|| anyhow!("candidate seed disappeared during AI profile update"))?;
+        // The model may describe an appearance, but identity is owned by the
+        // server: keep the persisted seed and derive all visual details from
+        // the validated age/gender pair. This prevents a later AI response
+        // from changing a candidate's hair or body while preserving identity.
+        let appearance = create_appearance(seed, &candidate.gender, candidate.age);
+        let match_score = profile_match_score(
+            &candidate.skills,
+            &candidate.personality,
+            &candidate.work_style,
+            &candidate.expertise,
+        );
         sqlx::query(
             "UPDATE candidates SET name = ?, age = ?, gender = ?, title = ?, personality = ?,
              skills = ?, work_style = ?, strengths = ?, weaknesses = ?, expertise = ?,
@@ -835,8 +1064,8 @@ pub async fn apply_ai_candidate_profiles(
         .bind(serde_json::to_string(&candidate.strengths)?)
         .bind(serde_json::to_string(&candidate.weaknesses)?)
         .bind(serde_json::to_string(&candidate.expertise)?)
-        .bind(serde_json::to_string(&candidate.appearance)?)
-        .bind(candidate.match_score)
+        .bind(serde_json::to_string(&appearance)?)
+        .bind(match_score)
         .bind(candidate.interview_evaluation.trim())
         .bind(&now)
         .bind(company_id)
@@ -851,6 +1080,204 @@ pub async fn apply_ai_candidate_profiles(
         .into_iter()
         .find(|request| request.id == request_id)
         .ok_or_else(|| anyhow!("hiring request disappeared after AI profile update"))
+}
+
+const MAX_PROFILE_TEXT_LENGTH: usize = 240;
+const MAX_EVALUATION_LENGTH: usize = 1_000;
+const MAX_PROFILE_ITEMS: usize = 12;
+const MAX_PROFILE_TOTAL_LENGTH: usize = 2_000;
+
+fn validate_ai_candidate_profile(candidate: &AiCandidateProfile) -> Result<()> {
+    if !(18..=75).contains(&candidate.age)
+        || candidate.skills.is_empty()
+        || candidate.skills.len() > MAX_PROFILE_ITEMS
+        || candidate.match_score.clamp(0, 100) != candidate.match_score
+    {
+        return Err(anyhow!("model returned invalid candidate fields"));
+    }
+    validate_text(&candidate.name, "candidate name", MAX_PROFILE_TEXT_LENGTH)?;
+    validate_text(&candidate.title, "candidate title", MAX_PROFILE_TEXT_LENGTH)?;
+    if !matches!(candidate.gender.as_str(), "male" | "female" | "non_binary") {
+        return Err(anyhow!("model returned invalid candidate gender"));
+    }
+    validate_personality(&candidate.personality)?;
+    validate_appearance(&candidate.appearance)?;
+    validate_text(
+        &candidate.work_style,
+        "candidate work style",
+        MAX_PROFILE_TEXT_LENGTH,
+    )?;
+    if candidate
+        .skills
+        .iter()
+        .any(|skill| skill.level > 100 || validate_text(&skill.name, "skill name", 120).is_err())
+        || candidate
+            .skills
+            .iter()
+            .map(|skill| skill.name.trim().chars().count())
+            .sum::<usize>()
+            > MAX_PROFILE_TOTAL_LENGTH
+    {
+        return Err(anyhow!("model returned invalid candidate skills"));
+    }
+    validate_text_list(
+        &candidate.strengths,
+        "candidate strengths",
+        1,
+        MAX_PROFILE_ITEMS,
+    )?;
+    validate_text_list(
+        &candidate.weaknesses,
+        "candidate weaknesses",
+        1,
+        MAX_PROFILE_ITEMS,
+    )?;
+    validate_text_list(
+        &candidate.expertise,
+        "candidate expertise",
+        1,
+        MAX_PROFILE_ITEMS,
+    )?;
+    validate_text(
+        &candidate.interview_evaluation,
+        "interview evaluation",
+        MAX_EVALUATION_LENGTH,
+    )?;
+    Ok(())
+}
+
+fn validate_text(value: &str, field: &str, max_length: usize) -> Result<()> {
+    let length = value.trim().chars().count();
+    if length == 0 || length > max_length {
+        return Err(anyhow!(
+            "model returned invalid {field}: expected 1..={max_length} characters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_text_list(
+    values: &[String],
+    field: &str,
+    min_items: usize,
+    max_items: usize,
+) -> Result<()> {
+    if !(min_items..=max_items).contains(&values.len())
+        || values
+            .iter()
+            .any(|value| validate_text(value, field, MAX_PROFILE_TEXT_LENGTH).is_err())
+        || values
+            .iter()
+            .map(|value| value.trim().chars().count())
+            .sum::<usize>()
+            > MAX_PROFILE_TOTAL_LENGTH
+    {
+        return Err(anyhow!("model returned invalid {field}"));
+    }
+    Ok(())
+}
+
+fn validate_personality(personality: &PersonalityProfile) -> Result<()> {
+    let scores = [
+        personality.openness,
+        personality.conscientiousness,
+        personality.extraversion,
+        personality.agreeableness,
+        personality.emotional_stability,
+    ];
+    if scores.iter().any(|score| *score > 100)
+        || personality.traits.is_empty()
+        || personality.traits.len() > MAX_PROFILE_ITEMS
+        || personality.speech_habits.is_empty()
+        || personality.speech_habits.len() > MAX_PROFILE_ITEMS
+        || personality.behavior_habits.is_empty()
+        || personality.behavior_habits.len() > MAX_PROFILE_ITEMS
+    {
+        return Err(anyhow!("model returned invalid personality fields"));
+    }
+    validate_text_list(
+        &personality.traits,
+        "personality traits",
+        1,
+        MAX_PROFILE_ITEMS,
+    )?;
+    validate_text_list(
+        &personality.speech_habits,
+        "speech habits",
+        1,
+        MAX_PROFILE_ITEMS,
+    )?;
+    validate_text_list(
+        &personality.behavior_habits,
+        "behavior habits",
+        1,
+        MAX_PROFILE_ITEMS,
+    )?;
+    validate_text(
+        &personality.communication_style,
+        "communication style",
+        MAX_PROFILE_TEXT_LENGTH,
+    )?;
+    validate_text(
+        &personality.decision_style,
+        "decision style",
+        MAX_PROFILE_TEXT_LENGTH,
+    )?;
+    Ok(())
+}
+
+fn validate_appearance(appearance: &crate::models::AppearanceProfile) -> Result<()> {
+    if !appearance.height_scale.is_finite() || !(0.5..=1.5).contains(&appearance.height_scale) {
+        return Err(anyhow!("model returned invalid appearance fields"));
+    }
+    for (field, value) in [
+        ("appearance skin tone", appearance.skin_tone.as_str()),
+        ("appearance hair style", appearance.hair_style.as_str()),
+        ("appearance hair color", appearance.hair_color.as_str()),
+        ("appearance top style", appearance.top_style.as_str()),
+        ("appearance top color", appearance.top_color.as_str()),
+        ("appearance bottom style", appearance.bottom_style.as_str()),
+        ("appearance bottom color", appearance.bottom_color.as_str()),
+        ("appearance shoe color", appearance.shoe_color.as_str()),
+        ("appearance body type", appearance.body_type.as_str()),
+        ("appearance accessory", appearance.accessory.as_str()),
+    ] {
+        validate_text(value, field, 64)?;
+    }
+    if !matches!(appearance.body_type.as_str(), "slim" | "regular" | "broad") {
+        return Err(anyhow!("model returned invalid appearance body type"));
+    }
+    Ok(())
+}
+
+/// Derive the hiring score only from job-relevant profile data. In particular,
+/// age, gender and appearance are deliberately absent from this function.
+fn profile_match_score(
+    skills: &[SkillProfile],
+    personality: &PersonalityProfile,
+    work_style: &str,
+    expertise: &[String],
+) -> i64 {
+    let skill_average = if skills.is_empty() {
+        0.0
+    } else {
+        skills
+            .iter()
+            .map(|skill| f32::from(skill.level))
+            .sum::<f32>()
+            / skills.len() as f32
+    };
+    let personality_fit = (f32::from(personality.conscientiousness)
+        + f32::from(personality.emotional_stability))
+        / 2.0;
+    let profile_completeness = if work_style.trim().is_empty() || expertise.is_empty() {
+        0.0
+    } else {
+        100.0
+    };
+    (skill_average * 0.7 + personality_fit * 0.2 + profile_completeness * 0.1)
+        .round()
+        .clamp(0.0, 100.0) as i64
 }
 
 fn extract_json_object(value: &str) -> Result<&str> {
@@ -876,7 +1303,7 @@ pub async fn hire_candidate(
     let mut tx = pool.begin().await?;
     let candidate = sqlx::query(
         "SELECT c.id, c.name, c.age, c.gender, c.title, c.personality, c.skills,
-                c.appearance, c.hiring_request_id, r.floor_id
+                c.work_style, c.appearance, c.hiring_request_id, r.floor_id
          FROM candidates c
          JOIN hiring_requests r ON r.id = c.hiring_request_id AND r.company_id = ?
          WHERE c.id = ? AND c.hiring_request_id = ? AND c.status = 'AVAILABLE'",
@@ -932,6 +1359,7 @@ pub async fn hire_candidate(
     let employee_id = format!("employee-{}", Uuid::new_v4());
     let personality: String = candidate.try_get("personality")?;
     let skills: String = candidate.try_get("skills")?;
+    let work_style: String = candidate.try_get("work_style")?;
     let appearance: String = candidate.try_get("appearance")?;
     let name: String = candidate.try_get("name")?;
     let age: i64 = candidate.try_get("age")?;
@@ -946,10 +1374,10 @@ pub async fn hire_candidate(
     sqlx::query(
         "INSERT INTO employees
          (id, company_id, name, age, gender, role, department, title, status,
-          personality, skills, appearance, model_config, model_profile_id, desk_id,
+          personality, skills, work_style, appearance, model_config, model_profile_id, desk_id,
           floor_id, hired_at, current_state, activity, movement, location_id,
           position_x, position_y, room_id, device, posture, presence)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?, ?, ?, 'mock-profile-01', ?, ?,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?, ?, ?, ?, 'mock-profile-01', ?, ?,
                  ?, 'IDLE', 'IDLE', 'STATIONARY', ?, ?, ?, ?, 'NONE', 'STANDING', 'BUSY')",
     )
     .bind(&employee_id)
@@ -962,6 +1390,7 @@ pub async fn hire_candidate(
     .bind(&title)
     .bind(&personality)
     .bind(&skills)
+    .bind(&work_style)
     .bind(&appearance)
     .bind(model_config)
     .bind(&workstation_id)
@@ -1327,9 +1756,42 @@ async fn insert_floor_administrator(
     now: &str,
 ) -> Result<String> {
     let employee_id = format!("employee-{}", Uuid::new_v4());
-    let workstation_id = format!("workstation-{}", Uuid::new_v4());
-    let location_id = office::floor_location_id(floor_id, "hr_desk_01");
+    let mut workstation_id = None;
+    let mut location_id = office::floor_location_id(floor_id, "hr_desk_01");
     let room_id = office::floor_room_id(floor_id, "hr-office");
+    if let Some(existing) = sqlx::query(
+        "SELECT id, assigned_employee_id FROM workstations
+         WHERE company_id = ? AND floor_id = ? AND location_id = ?",
+    )
+    .bind(company_id)
+    .bind(floor_id)
+    .bind(&location_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    {
+        let assigned_employee_id: Option<String> = existing.try_get("assigned_employee_id")?;
+        let occupied_by_active_employee = if let Some(assigned_employee_id) = assigned_employee_id {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM employees
+                 WHERE company_id = ? AND id = ? AND employment_status = 'ACTIVE'",
+            )
+            .bind(company_id)
+            .bind(assigned_employee_id)
+            .fetch_one(&mut **tx)
+            .await?
+                > 0
+        } else {
+            false
+        };
+        if occupied_by_active_employee {
+            // A malformed legacy database can have a regular active employee
+            // at the old administrator location. Keep that assignment and
+            // provision a distinct administrator location instead.
+            location_id = format!("{location_id}__administrator");
+        } else {
+            workstation_id = Some(existing.try_get("id")?);
+        }
+    }
     sqlx::query(
         "INSERT OR IGNORE INTO office_locations
          (id, company_id, name, type, room_id, x, y, floor_id, created_at)
@@ -1374,6 +1836,11 @@ async fn insert_floor_administrator(
         traits: vec!["有条理".into(), "善于协调".into(), "主动巡查".into()],
         communication_style: "先确认人员与预算边界，再给出候选和执行建议".into(),
         decision_style: "依据任务状态、证据和Token预算进行干预".into(),
+        speech_habits: vec!["先复述关键需求".into(), "结尾给出明确的人员动作".into()],
+        behavior_habits: vec![
+            "定期巡查人员与任务状态".into(),
+            "先确认约束再安排面试".into(),
+        ],
     };
     let skills = vec![
         SkillProfile {
@@ -1394,28 +1861,48 @@ async fn insert_floor_administrator(
         },
     ];
     let appearance = create_appearance(seed, gender, age);
-    sqlx::query(
-        "INSERT INTO workstations
-         (id, company_id, floor_id, location_id, room_id, position_x, position_y,
-          orientation, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 70, 210, 'DOWN', 'AVAILABLE', ?, ?)",
-    )
-    .bind(&workstation_id)
-    .bind(company_id)
-    .bind(floor_id)
-    .bind(&location_id)
-    .bind(&room_id)
-    .bind(now)
-    .bind(now)
-    .execute(&mut **tx)
-    .await?;
+    let workstation_id = if let Some(workstation_id) = workstation_id {
+        sqlx::query(
+            "UPDATE workstations
+             SET room_id = ?, position_x = 70, position_y = 210, orientation = 'DOWN',
+                 status = 'AVAILABLE', assigned_employee_id = NULL, updated_at = ?
+             WHERE company_id = ? AND floor_id = ? AND id = ?",
+        )
+        .bind(&room_id)
+        .bind(now)
+        .bind(company_id)
+        .bind(floor_id)
+        .bind(&workstation_id)
+        .execute(&mut **tx)
+        .await?;
+        workstation_id
+    } else {
+        let workstation_id = format!("workstation-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO workstations
+             (id, company_id, floor_id, location_id, room_id, position_x, position_y,
+              orientation, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 70, 210, 'DOWN', 'AVAILABLE', ?, ?)",
+        )
+        .bind(&workstation_id)
+        .bind(company_id)
+        .bind(floor_id)
+        .bind(&location_id)
+        .bind(&room_id)
+        .bind(now)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        workstation_id
+    };
     sqlx::query(
         "INSERT INTO employees
          (id, company_id, name, age, gender, role, department, title, status,
-          personality, skills, appearance, model_config, model_profile_id, desk_id,
+          personality, skills, work_style, appearance, model_config, model_profile_id, desk_id,
           floor_id, hired_at, current_state, activity, movement, location_id,
           position_x, position_y, room_id, device, posture, presence, is_floor_administrator)
-         VALUES (?, ?, ?, ?, ?, '楼层管理员', ?, '管理员', 'online', ?, ?, ?,
+         VALUES (?, ?, ?, ?, ?, '楼层管理员', ?, '管理员', 'online', ?, ?,
+                 '先核对人员与预算约束，再安排招聘、巡查和后续动作', ?,
                  '{\"provider\":\"mock\",\"model\":\"mock-office-v1\",\"mode\":\"mock\"}',
                  'mock-profile-01', ?, ?, ?, 'IDLE', 'IDLE', 'STATIONARY', ?, ?, ?, ?,
                  'COMPUTER', 'SITTING', 'AVAILABLE', 1)",
@@ -1486,7 +1973,8 @@ async fn insert_candidate_set(
             .take(6)
             .cloned()
             .collect::<Vec<_>>();
-        let match_score = 76 + (seed % 18) as i64;
+        let work_style = candidate_work_style(seed, &spec.title);
+        let match_score = profile_match_score(&skills, &personality, &work_style, &expertise);
         sqlx::query(
             "INSERT INTO candidates
              (id, company_id, hiring_request_id, position_id, name, age, gender, title,
@@ -1506,10 +1994,7 @@ async fn insert_candidate_set(
         .bind(&spec.title)
         .bind(serde_json::to_string(&personality)?)
         .bind(serde_json::to_string(&skills)?)
-        .bind(format!(
-            "由管理员根据“{}”需求拟定，偏好先确认目标再交付。",
-            spec.title
-        ))
+        .bind(work_style)
         .bind(serde_json::to_string(&strengths)?)
         .bind(serde_json::to_string(&weaknesses)?)
         .bind(serde_json::to_string(&expertise)?)
@@ -1537,20 +2022,81 @@ fn candidate_name(seed: u64, position_index: usize, candidate_index: usize) -> S
 }
 
 fn candidate_personality(seed: u64, preferences: &[String]) -> PersonalityProfile {
+    let communication_styles = [
+        "先确认目标和边界，再给出可执行方案",
+        "用事实和例子说明判断，最后明确下一步",
+        "先列出关键取舍，再说明我建议的路径",
+        "表达简洁，遇到风险会先说影响范围",
+    ];
+    let decision_styles = [
+        "结合事实、经验与结果反馈推进",
+        "优先验证最关键的假设，再逐步扩大范围",
+        "在交付速度与长期维护之间保持平衡",
+        "先按风险排序，再选择可恢复的方案",
+    ];
+    let speech_habit_sets = [
+        vec!["表达保持简洁".to_string(), "结尾明确下一步".to_string()],
+        vec!["常用具体例子".to_string(), "会标注当前假设".to_string()],
+        vec!["先复述问题".to_string(), "习惯列出取舍".to_string()],
+        vec![
+            "少寒暄，直接进入重点".to_string(),
+            "会说明验证方式".to_string(),
+        ],
+    ];
+    let behavior_habit_sets = [
+        vec![
+            "先做小范围验证再扩展".to_string(),
+            "会保留可回滚路径".to_string(),
+        ],
+        vec![
+            "习惯把任务拆成可交付步骤".to_string(),
+            "定期同步风险".to_string(),
+        ],
+        vec![
+            "专注时减少无关打断".to_string(),
+            "完成后主动整理记录".to_string(),
+        ],
+        vec![
+            "遇到阻塞会尽早求助".to_string(),
+            "会复盘并更新工作清单".to_string(),
+        ],
+    ];
+    let style_index = (seed as usize) % communication_styles.len();
     PersonalityProfile {
         openness: 60 + (seed % 30) as u8,
         conscientiousness: 68 + (seed % 25) as u8,
         extraversion: 45 + (seed % 40) as u8,
         agreeableness: 58 + (seed % 30) as u8,
         emotional_stability: 65 + (seed % 30) as u8,
-        traits: if preferences.is_empty() {
-            vec!["目标感清晰".to_string(), "愿意协作".to_string()]
-        } else {
-            preferences.iter().take(3).cloned().collect()
+        traits: {
+            let mut traits = if preferences.is_empty() {
+                vec!["目标感清晰".to_string(), "愿意协作".to_string()]
+            } else {
+                preferences.iter().take(2).cloned().collect()
+            };
+            let trait_pool = ["重视验证", "善于拆解", "保持专注", "主动同步"];
+            traits.push(trait_pool[(seed as usize / 7) % trait_pool.len()].to_string());
+            traits
         },
-        communication_style: "先确认目标和边界，再给出可执行方案".to_string(),
-        decision_style: "结合事实、经验与结果反馈推进".to_string(),
+        communication_style: communication_styles[style_index].to_string(),
+        decision_style: decision_styles[(seed as usize / 3) % decision_styles.len()].to_string(),
+        speech_habits: speech_habit_sets[style_index].clone(),
+        behavior_habits: behavior_habit_sets[(seed as usize / 5) % behavior_habit_sets.len()]
+            .clone(),
     }
+}
+
+fn candidate_work_style(seed: u64, title: &str) -> String {
+    let styles = [
+        "先拆成可验证的小步，完成一项就同步结果",
+        "偏好异步记录，集中时间处理高复杂度问题",
+        "先和协作者对齐边界，再快速交付可运行版本",
+        "先做风险排序，保留回滚方案后再扩大范围",
+    ];
+    format!(
+        "管理员针对“{title}”拟定：{}。",
+        styles[(seed as usize / 11) % styles.len()]
+    )
 }
 
 fn candidate_skills(requirements: &[String], seed: u64) -> Vec<SkillProfile> {
@@ -1669,9 +2215,13 @@ fn json_vec(value: String) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::{
-        administrator_intervention_intent, administrator_patrol_intent, candidate_refresh_intent,
-        derive_title, extract_count, extract_terms, hiring_intent, parse_position_specs,
+        administrator_intervention_intent, administrator_patrol_intent, candidate_personality,
+        candidate_refresh_intent, candidate_work_style, derive_title, extract_count, extract_terms,
+        hiring_intent, parse_position_specs, validate_ai_candidate_profile, AiCandidateProfile,
+        HiringPersonalizationResult, HiringRequestSummary,
     };
 
     #[test]
@@ -1702,5 +2252,95 @@ mod tests {
             "解除死循环并停止卡住任务"
         ));
         assert!(!administrator_intervention_intent("只查看，不要停止任务"));
+    }
+
+    #[test]
+    fn mock_candidate_personality_is_seed_stable_and_varied() {
+        let first = candidate_personality(42, &[]);
+        let second = candidate_personality(42, &[]);
+        let different = candidate_personality(47, &[]);
+        assert_eq!(first.communication_style, second.communication_style);
+        assert_eq!(first.speech_habits, second.speech_habits);
+        assert_eq!(first.behavior_habits, second.behavior_habits);
+        assert_ne!(first.communication_style, different.communication_style);
+        assert_ne!(first.behavior_habits, different.behavior_habits);
+        assert_ne!(
+            candidate_work_style(42, "工程师"),
+            candidate_work_style(99, "工程师")
+        );
+        assert!(!first.speech_habits.is_empty());
+        assert!(!first.behavior_habits.is_empty());
+    }
+
+    #[test]
+    fn hiring_fallback_is_explicit_and_uses_safe_reason() {
+        let request: HiringRequestSummary = serde_json::from_value(json!({
+            "id": "request-1",
+            "companyId": "company-01",
+            "floorId": "floor-01",
+            "requesterId": "hr-01",
+            "summary": "招聘工程师",
+            "status": "CANDIDATES_READY",
+            "sourceMessageId": null,
+            "positions": [],
+            "candidates": [],
+            "createdAt": "",
+            "updatedAt": ""
+        }))
+        .expect("test request should deserialize");
+        let fallback =
+            HiringPersonalizationResult::fallback(request, "administrator_model_output_invalid");
+        assert_eq!(fallback.generation_mode, "mock_fallback");
+        assert_eq!(
+            fallback.fallback_reason.as_deref(),
+            Some("administrator_model_output_invalid")
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_ai_candidate_profile_before_persistence() {
+        let malformed: AiCandidateProfile = serde_json::from_value(json!({
+            "id": "candidate-1",
+            "name": "候选人",
+            "age": 30,
+            "gender": "female",
+            "title": "工程师",
+            "personality": {
+                "openness": 50,
+                "conscientiousness": 50,
+                "extraversion": 50,
+                "agreeableness": 50,
+                "emotionalStability": 50,
+                "traits": ["可靠"],
+                "communicationStyle": "先确认目标",
+                "decisionStyle": "依据证据",
+                "speechHabits": ["先复述"],
+                "behaviorHabits": ["先验证"]
+            },
+            "skills": [{"name": "Rust", "level": 80}],
+            "workStyle": "先拆解再交付",
+            "strengths": [],
+            "weaknesses": ["需要更多领域经验"],
+            "expertise": ["Rust"],
+            "appearance": {
+                "seed": 1,
+                "skinTone": "#F3C7A8",
+                "hairStyle": "short",
+                "hairColor": "#241A17",
+                "topStyle": "shirt",
+                "topColor": "#3E5C76",
+                "bottomStyle": "trousers",
+                "bottomColor": "#26364A",
+                "shoeColor": "#1D2026",
+                "bodyType": "regular",
+                "heightScale": 1.0,
+                "glasses": false,
+                "accessory": "none"
+            },
+            "matchScore": 80,
+            "interviewEvaluation": "回答具体"
+        }))
+        .expect("test profile should deserialize");
+        assert!(validate_ai_candidate_profile(&malformed).is_err());
     }
 }

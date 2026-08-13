@@ -61,6 +61,8 @@ export interface PersonalityProfile {
   traits: string[];
   communicationStyle: string;
   decisionStyle: string;
+  speechHabits: string[];
+  behaviorHabits: string[];
 }
 
 export interface SkillProfile {
@@ -135,6 +137,26 @@ export interface ContainerRuntimeStatus {
   lastError?: string | null;
 }
 
+export interface SystemLogEntry {
+  id: string;
+  timestamp: string;
+  level: 'ERROR' | 'WARN' | 'INFO' | string;
+  source: 'JOB' | 'RUNTIME' | 'RUNTIME_EVENT' | 'MODEL' | string;
+  employeeId?: string | null;
+  employeeName?: string | null;
+  message: string;
+  details?: string | null;
+  jobId?: string | null;
+  runtimeRunId?: string | null;
+  eventType?: string | null;
+  model?: string | null;
+}
+
+export interface SystemLogsResponse {
+  entries: SystemLogEntry[];
+  containerRuntime: ContainerRuntimeStatus;
+}
+
 export interface RuntimeWorkspaceSummary {
   id: string;
   companyId: string;
@@ -191,6 +213,7 @@ export interface Employee {
   isFloorAdministrator: boolean;
   personality: PersonalityProfile;
   skills: SkillProfile[];
+  workStyle: string;
   appearance: AppearanceProfile;
   modelConfig: AgentModelConfig;
   modelProfileId?: string;
@@ -311,6 +334,93 @@ export interface MessageRecord {
   jobId?: string | null;
   meetingId?: string | null;
   broadcastId?: string | null;
+}
+
+export interface A2aFaceToFaceSession {
+  id: string;
+  companyId: string;
+  contextId: string;
+  initiatorId: string;
+  recipientId: string;
+  initiatorLocationId: string;
+  recipientLocationId: string;
+  roomId: string;
+  status: string;
+  maxTurns: number;
+  turnsUsed: number;
+  tokenBudget: number;
+  tokensUsed: number;
+  companyTaskId?: string | null;
+  expiresAt: string;
+  createdAt: string;
+  activatedAt?: string | null;
+  closedAt?: string | null;
+  closeReason?: string | null;
+}
+
+export interface A2aCommunicationMessage {
+  id: string;
+  sessionId: string;
+  contextId: string;
+  taskId?: string | null;
+  senderId: string;
+  recipientId: string;
+  role: string;
+  parts: unknown;
+  metadata: unknown;
+  direction: string;
+  createdAt: string;
+}
+
+export interface A2aCommunicationTask {
+  id: string;
+  contextId: string;
+  sessionId: string;
+  senderId: string;
+  recipientId: string;
+  companyTaskId?: string | null;
+  agentJobId?: string | null;
+  state: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string | null;
+  error?: string | null;
+}
+
+export interface A2aCommunicationAudit {
+  id: string;
+  sessionId?: string | null;
+  taskId?: string | null;
+  actorId?: string | null;
+  action: string;
+  outcome: string;
+  details: unknown;
+  createdAt: string;
+}
+
+export interface A2aCommunicationDetail {
+  session: A2aFaceToFaceSession;
+  messages: A2aCommunicationMessage[];
+  tasks: A2aCommunicationTask[];
+  audit: A2aCommunicationAudit[];
+}
+
+export interface RuntimeToolApprovalSummary {
+  id: string;
+  companyId: string;
+  runId: string;
+  agentJobId: string;
+  employeeId: string;
+  functionCallId: string;
+  toolName: string;
+  argumentsRedacted: string;
+  argumentsFingerprint: string;
+  status: string;
+  decidedBy?: string | null;
+  decisionReason?: string | null;
+  createdAt: string;
+  expiresAt: string;
+  decidedAt?: string | null;
 }
 
 export interface EmployeeMessageHistoryState {
@@ -599,4 +709,10 @@ export interface CompanyStoreState {
   connectionStatus: 'connecting' | 'connected' | 'disconnected';
   activeFloorId: string | null;
   terminationPreview: TerminationPreview | null;
+  a2aSessions: A2aFaceToFaceSession[];
+  a2aCommunications: Record<string, A2aCommunicationDetail>;
+  a2aLoading: boolean;
+  a2aCommunicationLoading: Record<string, boolean>;
+  runtimeApprovals: RuntimeToolApprovalSummary[];
+  runtimeApprovalsLoading: boolean;
 }

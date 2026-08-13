@@ -25,6 +25,10 @@ pub struct PersonalityProfile {
     pub traits: Vec<String>,
     pub communication_style: String,
     pub decision_style: String,
+    #[serde(default)]
+    pub speech_habits: Vec<String>,
+    #[serde(default)]
+    pub behavior_habits: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -87,6 +91,7 @@ pub struct Employee {
     pub is_floor_administrator: bool,
     pub personality: PersonalityProfile,
     pub skills: Vec<SkillProfile>,
+    pub work_style: String,
     pub appearance: AppearanceProfile,
     pub model_config: AgentModelConfig,
     pub model_profile_id: Option<String>,
@@ -178,6 +183,33 @@ pub struct RuntimeEnvironmentSuggestionSummary {
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeToolApprovalSummary {
+    pub id: String,
+    pub company_id: String,
+    pub run_id: String,
+    pub agent_job_id: String,
+    pub employee_id: String,
+    pub function_call_id: String,
+    pub tool_name: String,
+    pub arguments_redacted: String,
+    pub arguments_fingerprint: String,
+    pub status: String,
+    pub decided_by: Option<String>,
+    pub decision_reason: Option<String>,
+    pub created_at: String,
+    pub expires_at: String,
+    pub decided_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeToolApprovalDecision {
+    pub decision: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -627,8 +659,138 @@ pub struct MessageHistoryQuery {
     pub before: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct A2aHistoryQuery {
+    pub limit: Option<u32>,
+    pub before: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct WebSocketQuery {
     #[serde(rename = "companyId")]
     pub company_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aFaceToFaceSessionInput {
+    pub initiator_id: String,
+    pub recipient_id: String,
+    pub company_task_id: Option<String>,
+    pub max_turns: Option<i64>,
+    pub token_budget: Option<i64>,
+    pub ttl_seconds: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aFaceToFaceSession {
+    pub id: String,
+    pub company_id: String,
+    pub context_id: String,
+    pub initiator_id: String,
+    pub recipient_id: String,
+    pub initiator_location_id: String,
+    pub recipient_location_id: String,
+    pub room_id: String,
+    pub status: String,
+    pub max_turns: i64,
+    pub turns_used: i64,
+    pub token_budget: i64,
+    pub tokens_used: i64,
+    pub company_task_id: Option<String>,
+    pub expires_at: String,
+    pub created_at: String,
+    pub activated_at: Option<String>,
+    pub closed_at: Option<String>,
+    pub close_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aCommunicationMessage {
+    pub id: String,
+    pub session_id: String,
+    pub context_id: String,
+    pub task_id: Option<String>,
+    pub sender_id: String,
+    pub recipient_id: String,
+    pub role: String,
+    pub parts: Value,
+    pub metadata: Value,
+    pub direction: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aCommunicationTask {
+    pub id: String,
+    pub context_id: String,
+    pub session_id: String,
+    pub sender_id: String,
+    pub recipient_id: String,
+    pub company_task_id: Option<String>,
+    pub agent_job_id: Option<String>,
+    pub state: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aCommunicationAudit {
+    pub id: String,
+    pub session_id: Option<String>,
+    pub task_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub action: String,
+    pub outcome: String,
+    pub details: Value,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aCommunicationDetail {
+    pub session: A2aFaceToFaceSession,
+    pub messages: Vec<A2aCommunicationMessage>,
+    pub tasks: Vec<A2aCommunicationTask>,
+    pub audit: Vec<A2aCommunicationAudit>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aFaceToFaceSessionCreated {
+    pub session: A2aFaceToFaceSession,
+    pub capability_token: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aPart {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aMessageInput {
+    pub message_id: String,
+    pub role: String,
+    pub parts: Vec<A2aPart>,
+    pub context_id: Option<String>,
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aSendMessageInput {
+    pub message: A2aMessageInput,
 }

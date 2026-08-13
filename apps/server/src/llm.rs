@@ -35,9 +35,12 @@ pub async fn chat(
         let content = if system_prompt.contains("会议桌旁") {
             mock_meeting_reply(system_prompt, latest)
         } else {
-            format!(
-                "我已收到你的消息：{}。当前运行在 Mock Provider；切换到 OpenAI Compatible Provider 后，我会继续沿用同一条持久化工作流。",
-                latest
+            apply_mock_voice(
+                system_prompt,
+                &format!(
+                    "我已收到你的消息：{}。当前运行在 Mock Provider；切换模型后会沿用同一条持久化工作流。",
+                    latest
+                ),
             )
         };
         return Ok(ChatResponse {
@@ -218,10 +221,31 @@ fn mock_meeting_reply(system_prompt: &str, latest: &str) -> String {
     } else {
         "从我的职能角度，我需要确认：这项工作的目标、优先级和完成标准是什么？有哪些不能突破的时间、预算或风险边界？"
     };
-    format!(
-        "我对“{}”有一个需要确认的细节：{}",
-        normalized, role_question
+    apply_mock_voice(
+        system_prompt,
+        &format!("关于“{}”：{}", normalized, role_question),
     )
+}
+
+fn apply_mock_voice(system_prompt: &str, content: &str) -> String {
+    let prefix = if system_prompt.contains("姓名：林屿") {
+        "结论是，"
+    } else if system_prompt.contains("姓名：苏晴") {
+        "我确认一下："
+    } else if system_prompt.contains("姓名：周启") {
+        "先按目标、场景、验收三点来看："
+    } else if system_prompt.contains("姓名：沈知夏") {
+        "我会更倾向于从用户实际感受出发："
+    } else if system_prompt.contains("姓名：陈默") {
+        "可以，前提是边界明确。"
+    } else if system_prompt.contains("姓名：顾言") {
+        "这里有一个前提需要先钉住："
+    } else if system_prompt.contains("姓名：唐宁") {
+        "先反过来问一句：如果关键边界条件不成立呢？"
+    } else {
+        ""
+    };
+    format!("{prefix}{content}")
 }
 
 fn contains_any(value: &str, candidates: &[&str]) -> bool {
@@ -247,6 +271,18 @@ fn safe_body(value: &str, api_key: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    use super::apply_mock_voice;
+
+    #[test]
+    fn mock_employee_voices_are_distinct() {
+        let backend = apply_mock_voice("姓名：顾言", "需要确认数据边界。");
+        let designer = apply_mock_voice("姓名：沈知夏", "需要确认数据边界。");
+
+        assert!(backend.starts_with("这里有一个前提"));
+        assert!(designer.starts_with("我会更倾向于"));
+        assert_ne!(backend, designer);
+    }
 
     use super::parse_usage;
 

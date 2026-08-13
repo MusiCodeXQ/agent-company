@@ -209,6 +209,12 @@ Browser Persists Message
 
 The browser never calls the LLM directly and never receives the complete provider API key.
 
+## Governed Face-to-Face A2A
+
+Employees can collaborate through A2A HTTP+JSON only through the Company A2A Gateway. Creating a face-to-face session reserves two seats and starts real backend-driven movement. The capability becomes usable only after both animated employees have arrived in the same room, and every message rechecks presence, turn order, turn/token budgets, and expiry. Leaving an assigned seat closes the session immediately.
+
+The gateway exposes Agent Cards, `message:send`, Task retrieval and cancellation, while persisting the A2A Message/Task, linked company Message/Agent Job, artifacts, and audit records in SQLite. Requests use `Authorization: Bearer <capability>`, `X-A2A-Sender-Id`, and `A2A-Version: 1.0`; only the capability hash is stored.
+
 ## Optional: Employee Docker Runtime
 
 Build the base image:

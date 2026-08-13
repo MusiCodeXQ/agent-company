@@ -1,6 +1,6 @@
 use axum::{
     extract::{ws::WebSocketUpgrade, Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post, put},
     Json, Router,
@@ -9,15 +9,16 @@ use chrono::Utc;
 use serde_json::json;
 
 use crate::{
+    a2a,
     app_state::AppState,
     container_runtime, db, events, llm, model_profiles,
     models::{
-        CompanySnapshot, EmployeeModelProfileInput, EventsQuery, FloorInput, FloorUpdateInput,
-        HireCandidateInput, MeetingInput, MessageHistoryQuery, MessageInput, ModelProfileInput,
-        ModelProfileUpdate, MoveAgentInput, RuntimeProvisionInput, TerminationInput,
-        WebSocketQuery, WorkstationInput,
+        A2aFaceToFaceSessionInput, A2aSendMessageInput, CompanySnapshot, EmployeeModelProfileInput,
+        EventsQuery, FloorInput, FloorUpdateInput, HireCandidateInput, MeetingInput,
+        MessageHistoryQuery, MessageInput, ModelProfileInput, ModelProfileUpdate, MoveAgentInput,
+        RuntimeProvisionInput, TerminationInput, WebSocketQuery, WorkstationInput,
     },
-    offboarding, office, openclaw, organization, runtime_store, spatial, websocket,
+    offboarding, office, openclaw, organization, runtime_store, spatial, system_logs, websocket,
 };
 
 const COMPANY_ID: &str = "company-01";
@@ -91,6 +92,18 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/companies/{company_id}/jobs", get(company_jobs))
         .route(
+            "/api/companies/{company_id}/system-logs",
+            get(company_system_logs),
+        )
+        .route(
+            "/api/companies/{company_id}/runtime/approvals",
+            get(list_runtime_tool_approvals),
+        )
+        .route(
+            "/api/companies/{company_id}/runtime/approvals/{approval_id}/decision",
+            post(decide_runtime_tool_approval),
+        )
+        .route(
             "/api/companies/{company_id}/floors",
             get(list_floors).post(create_floor),
         )
@@ -126,6 +139,34 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/companies/{company_id}/agents/{agent_id}/move",
             post(move_agent),
+        )
+        .route(
+            "/api/companies/{company_id}/a2a/face-to-face-sessions",
+            post(create_a2a_face_to_face_session),
+        )
+        .route(
+            "/api/companies/{company_id}/a2a/face-to-face-sessions/{session_id}",
+            get(get_a2a_face_to_face_session).delete(close_a2a_face_to_face_session),
+        )
+        .route(
+            "/api/companies/{company_id}/a2a/communications",
+            get(list_a2a_communications),
+        )
+        .route(
+            "/api/companies/{company_id}/a2a/communications/{session_id}",
+            get(get_a2a_communication),
+        )
+        .route(
+            "/api/companies/{company_id}/a2a/agents/{agent_id}/.well-known/agent-card.json",
+            get(get_a2a_agent_card),
+        )
+        .route(
+            "/api/companies/{company_id}/a2a/agents/{agent_id}/message:send",
+            post(send_a2a_message),
+        )
+        .route(
+            "/api/companies/{company_id}/a2a/tasks/{*task_operation}",
+            get(get_a2a_task).post(cancel_a2a_task),
         )
         .route("/ws", get(websocket_upgrade))
         .with_state(state)
@@ -215,7 +256,9 @@ async fn snapshot(
         server_time: Utc::now().to_rfc3339(),
         recent_events: events::recent(&state.pool, COMPANY_ID).await?,
         openclaw: openclaw::config_status(),
-        container_runtime: state.container_engine.status().await,
+        container_runtime: system_logs::sanitize_container_status(
+            state.container_engine.status().await,
+        ),
         environment_suggestions: runtime_store::environment_suggestions(&state.pool, COMPANY_ID)
             .await?,
     }))
@@ -282,7 +325,9 @@ async fn openclaw_status() -> Result<Json<crate::models::OpenClawStatus>, ApiErr
 async fn container_runtime_status(
     State(state): State<AppState>,
 ) -> Json<crate::models::ContainerRuntimeStatus> {
-    Json(state.container_engine.status().await)
+    Json(system_logs::sanitize_container_status(
+        state.container_engine.status().await,
+    ))
 }
 
 async fn termination_preview(
@@ -621,6 +666,69 @@ async fn company_jobs(
     Ok(Json(db::jobs(&state.pool, &company_id).await?))
 }
 
+async fn company_system_logs(
+    State(state): State<AppState>,
+    Path(company_id): Path<String>,
+    Query(query): Query<system_logs::SystemLogsQuery>,
+) -> Result<Json<system_logs::SystemLogsResponse>, ApiError> {
+    let entries = system_logs::collect(&state.pool, &company_id, &query).await?;
+    Ok(Json(system_logs::SystemLogsResponse {
+        entries,
+        container_runtime: system_logs::sanitize_container_status(
+            state.container_engine.status().await,
+        ),
+    }))
+}
+
+async fn list_runtime_tool_approvals(
+    State(state): State<AppState>,
+    Path(company_id): Path<String>,
+) -> Result<Json<Vec<crate::models::RuntimeToolApprovalSummary>>, ApiError> {
+    Ok(Json(
+        runtime_store::pending_tool_approvals(&state.pool, &company_id).await?,
+    ))
+}
+
+async fn decide_runtime_tool_approval(
+    State(state): State<AppState>,
+    Path((company_id, approval_id)): Path<(String, String)>,
+    Json(input): Json<crate::models::RuntimeToolApprovalDecision>,
+) -> Result<Json<crate::models::RuntimeToolApprovalSummary>, ApiError> {
+    let decision = match input.decision.to_ascii_uppercase().as_str() {
+        "APPROVE" | "APPROVED" => "APPROVED",
+        "DENY" | "DENIED" => "DENIED",
+        _ => return Err(ApiError::bad_request("decision must be APPROVE or DENY")),
+    };
+    let approval = runtime_store::decide_tool_approval(
+        &state.pool,
+        &company_id,
+        &approval_id,
+        decision,
+        "user",
+        input.reason.as_deref(),
+    )
+    .await?
+    .ok_or_else(|| ApiError::bad_request("approval was not pending or was not found"))?;
+    events::emit(
+        &state,
+        &company_id,
+        "runtime.approval.decided",
+        Some(&approval.employee_id),
+        Some(&approval.run_id),
+        json!({
+            "approvalId": approval.id,
+            "jobId": approval.agent_job_id,
+            "employeeId": approval.employee_id,
+            "toolName": approval.tool_name,
+            "status": approval.status,
+            "decidedBy": approval.decided_by,
+        }),
+    )
+    .await?;
+    state.worker_notify.notify_one();
+    Ok(Json(approval))
+}
+
 async fn list_floors(
     State(state): State<AppState>,
     Path(company_id): Path<String>,
@@ -823,16 +931,43 @@ async fn refresh_candidates(
     State(state): State<AppState>,
     Path((company_id, request_id)): Path<(String, String)>,
 ) -> Result<Json<crate::models::HiringRequestSummary>, ApiError> {
-    let request = organization::refresh_candidates(&state.pool, &company_id, &request_id)
+    let template = organization::refresh_candidates(&state.pool, &company_id, &request_id)
         .await
         .map_err(ApiError::from_anyhow)?;
+    let generation = match organization::personalize_hiring_candidates(
+        &state.pool,
+        &company_id,
+        &request_id,
+        template.requester_id.as_deref(),
+        None,
+    )
+    .await
+    {
+        Ok(generation) => generation,
+        Err(_error) => {
+            tracing::warn!(
+                request_id,
+                fallback_reason = organization::FALLBACK_GENERATION_SERVICE_UNAVAILABLE,
+                "HTTP hiring refresh fell back to committed deterministic candidates"
+            );
+            organization::HiringPersonalizationResult::fallback(
+                template,
+                organization::FALLBACK_GENERATION_SERVICE_UNAVAILABLE,
+            )
+        }
+    };
+    let request = generation.request.clone();
     events::emit(
         &state,
         &company_id,
         "hiring.candidates.refreshed",
         request.requester_id.as_deref(),
         Some(&request_id),
-        serde_json::json!({ "request": request }),
+        serde_json::json!({
+            "request": request.clone(),
+            "generationMode": generation.generation_mode,
+            "fallbackReason": generation.fallback_reason,
+        }),
     )
     .await?;
     Ok(Json(request))
@@ -947,6 +1082,173 @@ async fn move_agent(
     .await
     .map_err(ApiError::from_anyhow)?;
     Ok((StatusCode::ACCEPTED, Json(movement)))
+}
+
+async fn create_a2a_face_to_face_session(
+    State(state): State<AppState>,
+    Path(company_id): Path<String>,
+    Json(input): Json<A2aFaceToFaceSessionInput>,
+) -> Result<(StatusCode, Json<crate::models::A2aFaceToFaceSessionCreated>), ApiError> {
+    let created = a2a::create_face_to_face_session(&state, &company_id, input)
+        .await
+        .map_err(ApiError::from_anyhow)?;
+    Ok((StatusCode::ACCEPTED, Json(created)))
+}
+
+async fn get_a2a_face_to_face_session(
+    State(state): State<AppState>,
+    Path((company_id, session_id)): Path<(String, String)>,
+) -> Result<Json<crate::models::A2aFaceToFaceSession>, ApiError> {
+    Ok(Json(
+        a2a::session(&state.pool, &company_id, &session_id)
+            .await
+            .map_err(ApiError::from_anyhow)?,
+    ))
+}
+
+async fn close_a2a_face_to_face_session(
+    State(state): State<AppState>,
+    Path((company_id, session_id)): Path<(String, String)>,
+) -> Result<Json<crate::models::A2aFaceToFaceSession>, ApiError> {
+    Ok(Json(
+        a2a::close_session(&state, &company_id, &session_id, "closed by API")
+            .await
+            .map_err(ApiError::from_anyhow)?,
+    ))
+}
+
+async fn list_a2a_communications(
+    State(state): State<AppState>,
+    Path(company_id): Path<String>,
+    Query(query): Query<crate::models::A2aHistoryQuery>,
+) -> Result<Json<Vec<crate::models::A2aFaceToFaceSession>>, ApiError> {
+    Ok(Json(
+        a2a::list_communications(
+            &state.pool,
+            &company_id,
+            query.limit.unwrap_or(40),
+            query.before.as_deref(),
+        )
+        .await
+        .map_err(ApiError::from_anyhow)?,
+    ))
+}
+
+async fn get_a2a_communication(
+    State(state): State<AppState>,
+    Path((company_id, session_id)): Path<(String, String)>,
+) -> Result<Json<crate::models::A2aCommunicationDetail>, ApiError> {
+    Ok(Json(
+        a2a::communication_detail(&state.pool, &company_id, &session_id)
+            .await
+            .map_err(ApiError::from_anyhow)?,
+    ))
+}
+
+async fn get_a2a_agent_card(
+    State(state): State<AppState>,
+    Path((company_id, agent_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<a2a::AgentCard>, ApiError> {
+    let scheme = header_value(&headers, "x-forwarded-proto").unwrap_or("http");
+    let host = header_value(&headers, "host").unwrap_or("localhost:3001");
+    let service_url = format!("{scheme}://{host}/api/companies/{company_id}/a2a/agents/{agent_id}");
+    Ok(Json(
+        a2a::agent_card(&state, &company_id, &agent_id, &service_url)
+            .await
+            .map_err(ApiError::from_anyhow)?,
+    ))
+}
+
+async fn send_a2a_message(
+    State(state): State<AppState>,
+    Path((company_id, agent_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<A2aSendMessageInput>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let version = header_value(&headers, "a2a-version").unwrap_or(a2a::PROTOCOL_VERSION);
+    if version != a2a::PROTOCOL_VERSION {
+        return Err(ApiError::bad_request(format!(
+            "unsupported A2A version {version}; supported version is {}",
+            a2a::PROTOCOL_VERSION
+        )));
+    }
+    let sender_id = header_value(&headers, "x-a2a-sender-id")
+        .ok_or_else(|| ApiError::bad_request("X-A2A-Sender-Id is required"))?;
+    let capability_token = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::bad_request("Bearer face-to-face capability token is required"))?;
+    let task = a2a::send_message(
+        &state,
+        &company_id,
+        &agent_id,
+        sender_id,
+        capability_token,
+        input,
+    )
+    .await
+    .map_err(ApiError::from_anyhow)?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+async fn get_a2a_task(
+    State(state): State<AppState>,
+    Path((company_id, task_operation)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if task_operation.contains(':') {
+        return Err(ApiError::bad_request("invalid A2A task path"));
+    }
+    let task_id = task_operation;
+    let (actor_id, capability_token) = a2a_credentials(&headers)?;
+    a2a::authorize_task(
+        &state.pool,
+        &company_id,
+        &task_id,
+        actor_id,
+        capability_token,
+    )
+    .await
+    .map_err(ApiError::from_anyhow)?;
+    Ok(Json(
+        a2a::get_task(&state.pool, &company_id, &task_id)
+            .await
+            .map_err(ApiError::from_anyhow)?,
+    ))
+}
+
+async fn cancel_a2a_task(
+    State(state): State<AppState>,
+    Path((company_id, task_operation)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let task_id = task_operation
+        .strip_suffix(":cancel")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("A2A POST task operation must end with :cancel"))?;
+    let (actor_id, capability_token) = a2a_credentials(&headers)?;
+    Ok(Json(
+        a2a::cancel_task(&state, &company_id, task_id, actor_id, capability_token)
+            .await
+            .map_err(ApiError::from_anyhow)?,
+    ))
+}
+
+fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn a2a_credentials(headers: &HeaderMap) -> Result<(&str, &str), ApiError> {
+    let actor_id = header_value(headers, "x-a2a-sender-id")
+        .ok_or_else(|| ApiError::bad_request("X-A2A-Sender-Id is required"))?;
+    let capability_token = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::bad_request("Bearer face-to-face capability token is required"))?;
+    Ok((actor_id, capability_token))
 }
 
 async fn websocket_upgrade(

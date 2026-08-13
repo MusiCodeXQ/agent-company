@@ -1,9 +1,24 @@
-use std::{collections::HashMap, io::Read, path::Path, sync::Arc, time::Duration};
+use chrono::Utc;
+use std::{
+    collections::HashMap,
+    io::{Read, Write},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
+use uuid::Uuid;
 
 use adk_agent::LlmAgentBuilder;
-use adk_core::{Agent, Content, Llm, Part, ToolContext};
+use adk_core::{
+    AdkError, Agent, CallbackContext, Content, ErrorCategory, ErrorComponent, Llm, LlmRequest,
+    LlmResponse, Part, RunConfig, SessionId, Tool, ToolConfirmationDecision, ToolContext, UserId,
+};
 use adk_devtools::{DevToolset, Workspace};
 use adk_model::{OpenAIClient, OpenAIConfig};
+use adk_plugin::{
+    AfterModelCallResult, AfterToolCallResult, BeforeModelCallResult, BeforeToolCallResult,
+    EnhancedPlugin, PluginContext,
+};
 use adk_runner::Runner;
 use adk_session::{CreateRequest, SessionService, SqliteSessionService};
 use adk_tool::FunctionTool;
@@ -15,10 +30,116 @@ use serde_json::Value;
 const APP_NAME: &str = "ai-company-employee";
 const SESSION_DATABASE_URL: &str = "sqlite:///agent-state/adk-sessions.db?mode=rwc";
 
+#[derive(Debug, Default)]
+struct GovernancePlugin;
+
+#[derive(Clone, Debug, Default)]
+struct GovernanceCounter {
+    model_calls: u32,
+    tool_calls: u32,
+}
+
+#[adk_core::async_trait]
+impl EnhancedPlugin for GovernancePlugin {
+    fn name(&self) -> &str {
+        "ai-company-governance"
+    }
+
+    fn priority(&self) -> i32 {
+        10
+    }
+
+    async fn before_tool_call(
+        &self,
+        tool: Arc<dyn Tool>,
+        args: Value,
+        _ctx: Arc<dyn CallbackContext>,
+        plugin_ctx: &PluginContext,
+    ) -> adk_core::Result<BeforeToolCallResult> {
+        let mut counter = plugin_ctx
+            .get::<GovernanceCounter>()
+            .await
+            .unwrap_or_default();
+        counter.tool_calls = counter.tool_calls.saturating_add(1);
+        plugin_ctx.insert(counter.clone()).await;
+        if counter.tool_calls > 20 {
+            return Err(AdkError::new(
+                ErrorComponent::Tool,
+                ErrorCategory::RateLimited,
+                "tool_budget_exceeded",
+                "governance tool-call budget exceeded",
+            ));
+        }
+        if tool.name() == "bash" {
+            let command = args
+                .get("command")
+                .or_else(|| args.get("cmd"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let blocked = ["sudo ", "apt ", "apt-get", "docker ", "mount ", "rm -rf /"];
+            if blocked.iter().any(|marker| command.contains(marker)) {
+                return Err(AdkError::new(
+                    ErrorComponent::Tool,
+                    ErrorCategory::Forbidden,
+                    "governance_blocked",
+                    "governance policy blocked a host/root/network escape command",
+                ));
+            }
+        }
+        Ok(BeforeToolCallResult::Continue(args))
+    }
+
+    async fn after_tool_call(
+        &self,
+        _tool: Arc<dyn Tool>,
+        _args: &Value,
+        result: Value,
+        _ctx: Arc<dyn CallbackContext>,
+        _plugin_ctx: &PluginContext,
+    ) -> adk_core::Result<AfterToolCallResult> {
+        Ok(AfterToolCallResult::Continue(redact_arguments(result)))
+    }
+
+    async fn before_model_call(
+        &self,
+        request: LlmRequest,
+        _ctx: Arc<dyn CallbackContext>,
+        plugin_ctx: &PluginContext,
+    ) -> adk_core::Result<BeforeModelCallResult> {
+        let mut counter = plugin_ctx
+            .get::<GovernanceCounter>()
+            .await
+            .unwrap_or_default();
+        counter.model_calls = counter.model_calls.saturating_add(1);
+        plugin_ctx.insert(counter.clone()).await;
+        if counter.model_calls > 30 {
+            return Err(AdkError::new(
+                ErrorComponent::Model,
+                ErrorCategory::RateLimited,
+                "model_budget_exceeded",
+                "governance model-call budget exceeded",
+            ));
+        }
+        Ok(BeforeModelCallResult::Continue(request))
+    }
+
+    async fn after_model_call(
+        &self,
+        response: LlmResponse,
+        _ctx: Arc<dyn CallbackContext>,
+        _plugin_ctx: &PluginContext,
+    ) -> adk_core::Result<AfterModelCallResult> {
+        Ok(AfterModelCallResult::Continue(response))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunRequest {
+    company_id: String,
     run_id: String,
+    agent_job_id: String,
     employee_id: String,
     session_id: String,
     system_prompt: String,
@@ -26,6 +147,16 @@ struct RunRequest {
     model: ModelRequest,
     #[serde(default = "default_true")]
     allow_tools: bool,
+    #[serde(default)]
+    tool_approval: Option<ToolApprovalRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolApprovalRequest {
+    call_id: String,
+    decision: String,
+    fingerprint: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,6 +175,8 @@ struct RunResponse {
     usage: Usage,
     events: Vec<RuntimeEvent>,
     environment_changes: Vec<EnvironmentChange>,
+    #[serde(default = "default_run_status")]
+    status: String,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -55,14 +188,37 @@ struct Usage {
     total_tokens: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RuntimeEvent {
+    #[serde(rename = "schemaVersion")]
+    schema_version: u32,
+    #[serde(rename = "eventId")]
+    event_id: String,
+    company_id: String,
+    employee_id: String,
+    #[serde(rename = "agentJobId")]
+    agent_job_id: String,
+    #[serde(rename = "runtimeRunId")]
+    runtime_run_id: String,
+    #[serde(rename = "runtimeSessionId")]
+    runtime_session_id: String,
+    timestamp: String,
+    sequence: u64,
     event_type: String,
     tool_name: Option<String>,
+    call_id: Option<String>,
     arguments: Option<Value>,
     status: Option<String>,
     result_summary: Option<String>,
+    fingerprint: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum WireMessage<'a> {
+    Event { event: &'a RuntimeEvent },
+    Result { response: &'a RunResponse },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -92,12 +248,29 @@ async fn main() -> Result<()> {
         .read_to_string(&mut input)
         .context("read runtime request")?;
     let request: RunRequest = serde_json::from_str(&input).context("decode runtime request")?;
-    let response = run(request).await?;
-    println!("{}", serde_json::to_string(&response)?);
+    let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
+    let mut emit = |event: &RuntimeEvent| -> Result<()> {
+        serde_json::to_writer(&mut stdout, &WireMessage::Event { event })?;
+        stdout.write_all(b"\n")?;
+        stdout.flush()?;
+        Ok(())
+    };
+    let response = run(request, &mut emit).await?;
+    serde_json::to_writer(
+        &mut stdout,
+        &WireMessage::Result {
+            response: &response,
+        },
+    )?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
     Ok(())
 }
 
-async fn run(request: RunRequest) -> Result<RunResponse> {
+async fn run(
+    request: RunRequest,
+    emit: &mut dyn FnMut(&RuntimeEvent) -> Result<()>,
+) -> Result<RunResponse> {
     if !matches!(
         request.model.protocol.to_ascii_lowercase().as_str(),
         "openai_compatible" | "openai-compatible" | "openai"
@@ -122,7 +295,8 @@ async fn run(request: RunRequest) -> Result<RunResponse> {
         .model(model)
         .max_iterations(20)
         .tool_timeout(Duration::from_secs(120))
-        .circuit_breaker_threshold(3);
+        .circuit_breaker_threshold(3)
+        .enhanced_plugin(Arc::new(GovernancePlugin));
     if request.allow_tools {
         let workspace = Workspace::new("/workspace")
             .writable(true)
@@ -146,7 +320,9 @@ async fn run(request: RunRequest) -> Result<RunResponse> {
                 "RUSTUP_HOME",
                 "GRADLE_USER_HOME",
             ]);
-        builder = builder.toolset(Arc::new(DevToolset::new(workspace)));
+        builder = builder
+            .toolset(Arc::new(DevToolset::new(workspace)))
+            .require_tool_confirmation("bash");
     }
     let image_package_tool = FunctionTool::new(
         "company_recommend_base_image_package",
@@ -173,12 +349,12 @@ async fn run(request: RunRequest) -> Result<RunResponse> {
         "Record a language or build toolchain installed under the persistent employee home directory.",
         |_ctx: Arc<dyn ToolContext>, args: Value| async move { record_personal_toolchain(&args).await },
     );
-    let agent: Arc<dyn Agent> = Arc::new(
-        builder
+    if request.allow_tools {
+        builder = builder
             .tool(Arc::new(image_package_tool))
-            .tool(Arc::new(personal_toolchain_tool))
-            .build()?,
-    );
+            .tool(Arc::new(personal_toolchain_tool));
+    }
+    let agent: Arc<dyn Agent> = Arc::new(builder.build()?);
 
     let sessions = Arc::new(SqliteSessionService::new(SESSION_DATABASE_URL).await?);
     sessions.migrate().await?;
@@ -196,31 +372,167 @@ async fn run(request: RunRequest) -> Result<RunResponse> {
         .agent(agent)
         .session_service(session_service)
         .build()?;
+    let run_config = request.tool_approval.as_ref().and_then(|approval| {
+        let decision = match approval.decision.to_ascii_lowercase().as_str() {
+            "approve" | "approved" => ToolConfirmationDecision::Approve,
+            "deny" | "denied" => ToolConfirmationDecision::Deny,
+            _ => return None,
+        };
+        let mut decisions = HashMap::new();
+        decisions.insert(approval.call_id.clone(), decision);
+        let mut fingerprints = HashMap::new();
+        fingerprints.insert(approval.call_id.clone(), approval.fingerprint.clone());
+        Some(
+            RunConfig::builder()
+                .tool_confirmation_decisions(decisions)
+                .tool_confirmation_fingerprints(fingerprints)
+                .build(),
+        )
+    });
     let mut stream = runner
-        .run_str(
-            &request.employee_id,
-            &request.session_id,
+        .run_with_config(
+            UserId::try_from(request.employee_id.as_str())?,
+            SessionId::try_from(request.session_id.as_str())?,
             Content::new("user").with_text(request.content),
+            run_config,
         )
         .await?;
 
-    let mut response = RunResponse::default();
+    let mut response = RunResponse {
+        status: default_run_status(),
+        ..RunResponse::default()
+    };
+    let mut sequence = 0_u64;
+    let mut waiting_for_approval = false;
     let mut pending_environment_changes: HashMap<String, Vec<EnvironmentChange>> = HashMap::new();
+    let started_event = RuntimeEvent {
+        schema_version: 1,
+        event_id: format!("runtime-event-{}", Uuid::new_v4()),
+        company_id: request.company_id.clone(),
+        employee_id: request.employee_id.clone(),
+        agent_job_id: request.agent_job_id.clone(),
+        runtime_run_id: request.run_id.clone(),
+        runtime_session_id: request.session_id.clone(),
+        timestamp: Utc::now().to_rfc3339(),
+        sequence: next_sequence(&mut sequence),
+        event_type: "run.started".to_string(),
+        tool_name: None,
+        call_id: None,
+        arguments: Some(serde_json::json!({ "runId": request.run_id })),
+        status: Some("RUNNING".to_string()),
+        result_summary: None,
+        fingerprint: None,
+    };
+    emit(&started_event)?;
+    response.events.push(started_event);
+    let model_started_event = RuntimeEvent {
+        schema_version: 1,
+        event_id: format!("runtime-event-{}", Uuid::new_v4()),
+        company_id: request.company_id.clone(),
+        employee_id: request.employee_id.clone(),
+        agent_job_id: request.agent_job_id.clone(),
+        runtime_run_id: request.run_id.clone(),
+        runtime_session_id: request.session_id.clone(),
+        timestamp: Utc::now().to_rfc3339(),
+        sequence: next_sequence(&mut sequence),
+        event_type: "model.started".to_string(),
+        tool_name: None,
+        call_id: None,
+        arguments: None,
+        status: Some("RUNNING".to_string()),
+        result_summary: None,
+        fingerprint: None,
+    };
+    emit(&model_started_event)?;
+    response.events.push(model_started_event);
     while let Some(event) = stream.next().await {
-        let event = event?;
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                let failed_event = RuntimeEvent {
+                    schema_version: 1,
+                    event_id: format!("runtime-event-{}", Uuid::new_v4()),
+                    company_id: request.company_id.clone(),
+                    employee_id: request.employee_id.clone(),
+                    agent_job_id: request.agent_job_id.clone(),
+                    runtime_run_id: request.run_id.clone(),
+                    runtime_session_id: request.session_id.clone(),
+                    timestamp: Utc::now().to_rfc3339(),
+                    sequence: next_sequence(&mut sequence),
+                    event_type: "run.failed".to_string(),
+                    tool_name: None,
+                    call_id: None,
+                    arguments: Some(serde_json::json!({ "error": error.to_string() })),
+                    status: Some("FAILED".to_string()),
+                    result_summary: Some(error.to_string()),
+                    fingerprint: None,
+                };
+                emit(&failed_event)?;
+                response.events.push(failed_event);
+                return Err(error.into());
+            }
+        };
+        if let Some(confirmation) = event.actions.tool_confirmation.as_ref() {
+            let args = redact_arguments(confirmation.args.clone());
+            let call_id = confirmation.function_call_id.clone();
+            let fingerprint = Some(adk_core::tool_call_fingerprint(
+                &confirmation.tool_name,
+                &confirmation.args,
+            ));
+            let runtime_event = RuntimeEvent {
+                schema_version: 1,
+                event_id: format!("runtime-event-{}", Uuid::new_v4()),
+                company_id: request.company_id.clone(),
+                employee_id: request.employee_id.clone(),
+                agent_job_id: request.agent_job_id.clone(),
+                runtime_run_id: request.run_id.clone(),
+                runtime_session_id: request.session_id.clone(),
+                timestamp: Utc::now().to_rfc3339(),
+                sequence: next_sequence(&mut sequence),
+                event_type: "approval.required".to_string(),
+                tool_name: Some(confirmation.tool_name.clone()),
+                call_id,
+                arguments: Some(args),
+                status: Some("WAITING_APPROVAL".to_string()),
+                result_summary: None,
+                fingerprint,
+            };
+            emit(&runtime_event)?;
+            response.events.push(runtime_event);
+            waiting_for_approval = true;
+        }
         for call in event.tool_calls() {
             let changes = environment_changes(call.name, call.args);
             if !changes.is_empty() {
                 pending_environment_changes
                     .insert(call.call_id.unwrap_or(call.name).to_string(), changes);
             }
-            response.events.push(RuntimeEvent {
-                event_type: "tool.called".to_string(),
+            let runtime_event = RuntimeEvent {
+                schema_version: 1,
+                event_id: format!("runtime-event-{}", Uuid::new_v4()),
+                company_id: request.company_id.clone(),
+                employee_id: request.employee_id.clone(),
+                agent_job_id: request.agent_job_id.clone(),
+                runtime_run_id: request.run_id.clone(),
+                runtime_session_id: request.session_id.clone(),
+                timestamp: Utc::now().to_rfc3339(),
+                sequence: next_sequence(&mut sequence),
+                event_type: "tool.requested".to_string(),
                 tool_name: Some(call.name.to_string()),
+                call_id: call.call_id.map(str::to_string),
                 arguments: Some(redact_arguments(call.args.clone())),
                 status: Some("RUNNING".to_string()),
                 result_summary: None,
-            });
+                fingerprint: Some(adk_core::tool_call_fingerprint(call.name, call.args)),
+            };
+            emit(&runtime_event)?;
+            response.events.push(runtime_event.clone());
+            let mut started_event = runtime_event;
+            started_event.event_id = format!("runtime-event-{}", Uuid::new_v4());
+            started_event.sequence = next_sequence(&mut sequence);
+            started_event.event_type = "tool.started".to_string();
+            emit(&started_event)?;
+            response.events.push(started_event);
         }
         for result in event.tool_results() {
             if result.name == "company_recommend_base_image_package"
@@ -233,13 +545,26 @@ async fn run(request: RunRequest) -> Result<RunResponse> {
                     }
                 }
             }
-            response.events.push(RuntimeEvent {
+            let runtime_event = RuntimeEvent {
+                schema_version: 1,
+                event_id: format!("runtime-event-{}", Uuid::new_v4()),
+                company_id: request.company_id.clone(),
+                employee_id: request.employee_id.clone(),
+                agent_job_id: request.agent_job_id.clone(),
+                runtime_run_id: request.run_id.clone(),
+                runtime_session_id: request.session_id.clone(),
+                timestamp: Utc::now().to_rfc3339(),
+                sequence: next_sequence(&mut sequence),
                 event_type: "tool.completed".to_string(),
                 tool_name: Some(result.name.to_string()),
+                call_id: result.call_id.map(str::to_string),
                 arguments: None,
                 status: Some("COMPLETED".to_string()),
                 result_summary: Some(compact_value(result.response)),
-            });
+                fingerprint: None,
+            };
+            emit(&runtime_event)?;
+            response.events.push(runtime_event);
         }
         if let Some(usage) = &event.llm_response.usage_metadata {
             response.usage.input_tokens += i64::from(usage.prompt_token_count);
@@ -247,6 +572,26 @@ async fn run(request: RunRequest) -> Result<RunResponse> {
             response.usage.cache_tokens +=
                 i64::from(usage.cache_read_input_token_count.unwrap_or_default());
             response.usage.total_tokens += i64::from(usage.total_token_count);
+            let usage_event = RuntimeEvent {
+                schema_version: 1,
+                event_id: format!("runtime-event-{}", Uuid::new_v4()),
+                company_id: request.company_id.clone(),
+                employee_id: request.employee_id.clone(),
+                agent_job_id: request.agent_job_id.clone(),
+                runtime_run_id: request.run_id.clone(),
+                runtime_session_id: request.session_id.clone(),
+                timestamp: Utc::now().to_rfc3339(),
+                sequence: next_sequence(&mut sequence),
+                event_type: "usage.updated".to_string(),
+                tool_name: None,
+                call_id: None,
+                arguments: Some(serde_json::json!({ "usage": &response.usage })),
+                status: Some("RUNNING".to_string()),
+                result_summary: None,
+                fingerprint: None,
+            };
+            emit(&usage_event)?;
+            response.events.push(usage_event);
         }
         if event.is_final_response()
             && let Some(content) = &event.llm_response.content
@@ -262,17 +607,59 @@ async fn run(request: RunRequest) -> Result<RunResponse> {
                 .join("");
         }
     }
+    if waiting_for_approval {
+        response.status = "WAITING_APPROVAL".to_string();
+        let runtime_event = RuntimeEvent {
+            schema_version: 1,
+            event_id: format!("runtime-event-{}", Uuid::new_v4()),
+            company_id: request.company_id.clone(),
+            employee_id: request.employee_id.clone(),
+            agent_job_id: request.agent_job_id.clone(),
+            runtime_run_id: request.run_id.clone(),
+            runtime_session_id: request.session_id.clone(),
+            timestamp: Utc::now().to_rfc3339(),
+            sequence: next_sequence(&mut sequence),
+            event_type: "run.waiting_approval".to_string(),
+            tool_name: None,
+            call_id: None,
+            arguments: Some(serde_json::json!({ "runId": request.run_id })),
+            status: Some("WAITING_APPROVAL".to_string()),
+            result_summary: None,
+            fingerprint: None,
+        };
+        emit(&runtime_event)?;
+        response.events.push(runtime_event);
+        return Ok(response);
+    }
     if response.content.trim().is_empty() {
         return Err(anyhow!("ADK runtime completed without a text response"));
     }
-    response.events.push(RuntimeEvent {
+    let runtime_event = RuntimeEvent {
+        schema_version: 1,
+        event_id: format!("runtime-event-{}", Uuid::new_v4()),
+        company_id: request.company_id.clone(),
+        employee_id: request.employee_id.clone(),
+        agent_job_id: request.agent_job_id.clone(),
+        runtime_run_id: request.run_id.clone(),
+        runtime_session_id: request.session_id.clone(),
+        timestamp: Utc::now().to_rfc3339(),
+        sequence: next_sequence(&mut sequence),
         event_type: "run.completed".to_string(),
         tool_name: None,
+        call_id: None,
         arguments: Some(serde_json::json!({"runId": request.run_id})),
         status: Some("COMPLETED".to_string()),
         result_summary: None,
-    });
+        fingerprint: None,
+    };
+    emit(&runtime_event)?;
+    response.events.push(runtime_event);
     Ok(response)
+}
+
+fn next_sequence(sequence: &mut u64) -> u64 {
+    *sequence = sequence.saturating_add(1);
+    *sequence
 }
 
 async fn record_personal_toolchain(args: &Value) -> Result<Value, adk_core::AdkError> {
@@ -474,6 +861,10 @@ fn safe_identity(value: &str) -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_run_status() -> String {
+    "COMPLETED".to_string()
 }
 
 #[cfg(test)]

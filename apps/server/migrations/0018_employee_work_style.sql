@@ -1,0 +1,1 @@
+ALTER TABLE employees ADD COLUMN work_style TEXT NOT NULL DEFAULT '';

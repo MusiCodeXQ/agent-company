@@ -564,6 +564,23 @@ interface CompanyMessage {
 
 不要给每条内部系统事件制造聊天气泡。气泡只显示真正的自然语言消息。
 
+## 11.1 受治理的面对面 A2A
+
+Agent 与 Agent 可以使用 A2A HTTP+JSON 协议交换 `Message`、创建有生命周期的 `Task` 并返回 `Artifact`，但员工 Runtime 不得彼此直连。正式通信必须经过 Company A2A Gateway，并与公司的 Message、Agent Job、Goal/Task 和审计记录关联持久化。
+
+面对面 A2A 的强制流程：
+
+```text
+创建 FaceToFaceSession
+-> 后端预约同一房间内的两个交流座位
+-> Spatial Simulation 驱动双方移动
+-> 后端确认双方到场后激活 A2A contextId
+-> 使用短期 capability token 进行 message:send
+-> 任一方离开、超时、超轮次或超 Token 预算时拒绝后续通信
+```
+
+前端动画不是权限依据。每一次 A2A 发送都必须由 Rust 后端重新校验双方的 `location_id`、`room_id` 和 `active_movement_id`。会话必须限制交替发言、最大轮数、单个在途 Task、Token 总预算和有效期；明文 capability token 只在创建时返回，数据库只保存摘要。
+
 ---
 
 # 12. 会议系统

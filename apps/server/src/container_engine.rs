@@ -7,7 +7,11 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::Command,
+    sync::mpsc,
+};
 
 use crate::models::ContainerRuntimeStatus;
 
@@ -60,6 +64,7 @@ pub trait ContainerEngine: Send + Sync {
         &self,
         request: &RunContainerRequest,
         input: &[u8],
+        output_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<Vec<u8>>;
 }
 
@@ -168,6 +173,7 @@ impl ContainerEngine for DockerCliEngine {
         &self,
         request: &RunContainerRequest,
         input: &[u8],
+        output_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<Vec<u8>> {
         self.require_enabled()?;
         validate_image_ref(&self.config.default_image)?;
@@ -258,21 +264,57 @@ impl ContainerEngine for DockerCliEngine {
             .await
             .context("send run request to employee runtime")?;
         drop(stdin);
-        let output =
-            match tokio::time::timeout(Duration::from_secs(900), child.wait_with_output()).await {
-                Ok(output) => output?,
-                Err(_) => {
-                    self.force_remove(&container_name).await;
-                    return Err(anyhow!("employee runtime exceeded 15 minute hard timeout"));
+        let mut stdout = BufReader::new(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("employee runtime stdout was not available"))?,
+        );
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("employee runtime stderr was not available"))?;
+        let stderr_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes).await;
+            bytes
+        });
+        let mut collected_stdout = Vec::new();
+        let mut line = String::new();
+        let result = tokio::time::timeout(Duration::from_secs(900), async {
+            loop {
+                line.clear();
+                let read = stdout.read_line(&mut line).await?;
+                if read == 0 {
+                    break;
                 }
-            };
-        if !output.status.success() {
+                collected_stdout.extend_from_slice(line.as_bytes());
+                output_tx
+                    .send(line.as_bytes().to_vec())
+                    .await
+                    .map_err(|_| anyhow!("employee runtime event stream receiver closed"))?;
+            }
+            let status = child.wait().await?;
+            let stderr = stderr_task
+                .await
+                .map_err(|error| anyhow!("join employee runtime stderr reader: {error}"))?;
+            Ok::<_, anyhow::Error>((status, stderr))
+        })
+        .await;
+        let (status, stderr) = match result {
+            Ok(result) => result?,
+            Err(_) => {
+                self.force_remove(&container_name).await;
+                return Err(anyhow!("employee runtime exceeded 15 minute hard timeout"));
+            }
+        };
+        if !status.success() {
             return Err(anyhow!(
                 "employee runtime failed: {}",
-                compact_stderr(&output.stderr)
+                compact_stderr(&stderr)
             ));
         }
-        Ok(output.stdout)
+        Ok(collected_stdout)
     }
 }
 

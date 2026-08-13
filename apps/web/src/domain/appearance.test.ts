@@ -14,5 +14,13 @@ describe('createAppearance', () => {
     expect(first.seed).not.toBe(other.seed);
     expect(first.topColor).not.toBe(other.topColor);
   });
-});
 
+  it('uses gender identity in stable character styling', () => {
+    const male = createAppearance(42, 'male', 34);
+    const female = createAppearance(42, 'female', 34);
+
+    expect(male.hairStyle).not.toBe(female.hairStyle);
+    expect(male.bottomStyle).not.toBe('skirt');
+    expect(female.beardStyle).toBeUndefined();
+  });
+});

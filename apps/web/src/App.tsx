@@ -1,12 +1,17 @@
 import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 import { OfficeCanvas } from './office/OfficeCanvas';
+import { SystemLogsPage } from './SystemLogsPage';
 import { selectedEmployee, useCompanyStore } from './store/company-store';
 import { formatTokens } from './domain/format';
 import type {
   ActorState,
   AgentJobSummary,
   AgentMemoryRecord,
+  A2aCommunicationDetail,
+  A2aCommunicationMessage,
+  A2aCommunicationTask,
+  A2aFaceToFaceSession,
   CandidateSummary,
   ContainerRuntimeStatus,
   DomainEvent,
@@ -18,6 +23,7 @@ import type {
   ModelProfileSummary,
   OpenClawStatus,
   RuntimeEnvironmentSuggestionSummary,
+  RuntimeToolApprovalSummary,
   TokenUsageSummary,
   TerminationPreview,
 } from './domain/types';
@@ -41,7 +47,7 @@ const STATE_LABELS: Record<ActorState, string> = {
   offline: '离线',
 };
 
-type View = 'office' | 'models';
+type View = 'office' | 'communications' | 'models' | 'logs';
 type DirectoryTab = 'active' | 'former' | 'hiring';
 
 const EMPTY_MEMORIES: AgentMemoryRecord[] = [];
@@ -54,16 +60,23 @@ const EMPTY_TOKEN_USAGE: TokenUsageSummary = {
 
 const NAV_ITEMS: Array<[string, string, View]> = [
   ['⌂', '公司', 'office'],
-  ['◌', '消息', 'office'],
+  ['◌', '消息', 'communications'],
   ['◇', '项目', 'office'],
   ['♙', '员工', 'office'],
   ['◈', '大模型', 'models'],
+  ['≋', '日志', 'logs'],
 ];
 
 export function App(): ReactElement {
   const bootstrap = useCompanyStore((state) => state.bootstrap);
   const employees = useCompanyStore((state) => state.employees);
   const events = useCompanyStore((state) => state.events);
+  const a2aSessions = useCompanyStore((state) => state.a2aSessions);
+  const a2aCommunications = useCompanyStore((state) => state.a2aCommunications);
+  const a2aLoading = useCompanyStore((state) => state.a2aLoading);
+  const a2aCommunicationLoading = useCompanyStore((state) => state.a2aCommunicationLoading);
+  const runtimeApprovals = useCompanyStore((state) => state.runtimeApprovals);
+  const runtimeApprovalsLoading = useCompanyStore((state) => state.runtimeApprovalsLoading);
   const messages = useCompanyStore((state) => state.messages);
   const selectedEmployeeId = useCompanyStore((state) => state.selectedEmployeeId);
   const phoneEmployeeId = useCompanyStore((state) => state.phoneEmployeeId);
@@ -73,6 +86,10 @@ export function App(): ReactElement {
   const activeFloorId = useCompanyStore((state) => state.activeFloorId);
   const loadBootstrap = useCompanyStore((state) => state.loadBootstrap);
   const connectWebSocket = useCompanyStore((state) => state.connectWebSocket);
+  const loadA2aSessions = useCompanyStore((state) => state.loadA2aSessions);
+  const loadA2aCommunication = useCompanyStore((state) => state.loadA2aCommunication);
+  const loadRuntimeToolApprovals = useCompanyStore((state) => state.loadRuntimeToolApprovals);
+  const decideRuntimeToolApproval = useCompanyStore((state) => state.decideRuntimeToolApproval);
   const sendMessage = useCompanyStore((state) => state.sendMessage);
   const openPhone = useCompanyStore((state) => state.openPhone);
   const closePhone = useCompanyStore((state) => state.closePhone);
@@ -131,6 +148,13 @@ export function App(): ReactElement {
     };
   }, [connectWebSocket, loadBootstrap]);
 
+  useEffect(() => {
+    if (activeView === 'communications') {
+      void loadA2aSessions();
+      void loadRuntimeToolApprovals();
+    }
+  }, [activeView, loadA2aSessions, loadRuntimeToolApprovals]);
+
   async function submitMessage(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     const content = message.trim();
@@ -173,7 +197,7 @@ export function App(): ReactElement {
           <nav className="main-nav">
             {NAV_ITEMS.map(([icon, label, view]) => (
               <button
-                className={`nav-item ${activeView === view && (view === 'models' || label === '公司') ? 'active' : ''}`}
+                className={`nav-item ${(view === 'office' ? activeView === 'office' && label === '公司' : activeView === view) ? 'active' : ''}`}
                 key={label}
                 type="button"
                 onClick={() => setActiveView(view)}
@@ -200,6 +224,16 @@ export function App(): ReactElement {
             <div className="console-hint">SQLite WAL · Agent Worker · 浏览器关闭后继续运行</div>
           </div>
 
+          {phoneEmployee && (
+            <PhonePanel
+              employee={phoneEmployee}
+              messages={messages}
+              bootstrap={bootstrap}
+              onClose={closePhone}
+              onSend={sendAgentMessage}
+            />
+          )}
+
           <div className="mini-metrics">
             <div><span>RUNTIME</span><strong>WORKER</strong></div>
             <div><span>EVENTS</span><strong>{events.length.toString().padStart(2, '0')}</strong></div>
@@ -209,6 +243,22 @@ export function App(): ReactElement {
         {activeView === 'models' ? (
           <main className="models-column">
             <ModelProviderPage providers={bootstrap?.modelProfiles ?? []} employees={employees} openclaw={bootstrap?.openclaw} containerRuntime={bootstrap?.containerRuntime} environmentSuggestions={bootstrap?.environmentSuggestions ?? []} />
+          </main>
+        ) : activeView === 'logs' ? (
+          <SystemLogsPage employees={employees} />
+        ) : activeView === 'communications' ? (
+          <main className="communications-column">
+          <CommunicationsPage
+              sessions={a2aSessions}
+              details={a2aCommunications}
+              employees={employees}
+              loading={a2aLoading}
+              detailLoading={a2aCommunicationLoading}
+            onOpen={(sessionId) => void loadA2aCommunication(sessionId)}
+            approvals={runtimeApprovals}
+            approvalsLoading={runtimeApprovalsLoading}
+            onDecideApproval={(approvalId, decision) => void decideRuntimeToolApproval(approvalId, decision)}
+          />
           </main>
         ) : (
           <>
@@ -267,15 +317,6 @@ export function App(): ReactElement {
         )}
       </div>
 
-      {phoneEmployee && (
-        <PhoneModal
-          employee={phoneEmployee}
-          messages={messages}
-          bootstrap={bootstrap}
-          onClose={closePhone}
-          onSend={sendAgentMessage}
-        />
-      )}
       {meetingMessageOpen && (
         <MeetingMessageModal
           meeting={activeMeeting ?? null}
@@ -378,7 +419,9 @@ function HiringPanel({
 }
 
 function CandidateCard({ candidate, busy, needsWorkstation, onHire }: { candidate: CandidateSummary; busy: boolean; needsWorkstation: boolean; onHire: () => void }): ReactElement {
-  return <article className="candidate-card"><div className="candidate-card-heading"><div className="candidate-avatar" style={{ background: candidate.appearance.topColor }}>{candidate.name.slice(0, 1)}</div><div><strong>{candidate.name}</strong><span>{candidate.title} · {candidate.age} 岁</span></div><b>{candidate.matchScore}%</b></div><div className="candidate-chips">{candidate.personality.traits.slice(0, 3).map((trait) => <span key={trait}>{trait}</span>)}</div><p>{candidate.strengths.slice(0, 2).join('、')}</p><small>技能：{candidate.skills.slice(0, 3).map((skill) => `${skill.name} ${skill.level}`).join(' · ')}</small><button className="send-button" type="button" disabled={busy} onClick={onHire}>{busy ? '处理中…' : needsWorkstation ? '创建工位并录用' : '录用并开始入职'}</button></article>;
+  const behaviorHabits = candidate.personality.behaviorHabits ?? [];
+  const speechHabits = candidate.personality.speechHabits ?? [];
+  return <article className="candidate-card"><div className="candidate-card-heading"><div className="candidate-avatar" style={{ background: candidate.appearance.topColor }}>{candidate.name.slice(0, 1)}</div><div><strong>{candidate.name}</strong><span>{candidate.title} · {candidate.age} 岁 · {genderLabel(candidate.gender)}</span></div><b>{candidate.matchScore}%</b></div><div className="candidate-chips">{candidate.personality.traits.slice(0, 3).map((trait) => <span key={trait}>{trait}</span>)}</div><p>{candidate.strengths.slice(0, 2).join('、')}</p><small>技能：{candidate.skills.slice(0, 3).map((skill) => `${skill.name} ${skill.level}`).join(' · ')}</small><small>沟通：{candidate.personality.communicationStyle}</small><small>说话：{speechHabits.slice(0, 2).join('、') || '未提供'}</small><small>行为：{behaviorHabits.slice(0, 2).join('、') || '未提供'}</small><small>工作方式：{candidate.workStyle || '未提供'}</small><button className="send-button" type="button" disabled={busy} onClick={onHire}>{busy ? '处理中…' : needsWorkstation ? '创建工位并录用' : '录用并开始入职'}</button></article>;
 }
 
 function TerminationModal({ preview, onClose, onConfirm }: { preview: TerminationPreview; onClose: () => void; onConfirm: (input: TerminationInput) => Promise<void> }): ReactElement {
@@ -542,7 +585,150 @@ function ModelProviderPage({ providers, employees, openclaw, containerRuntime, e
   );
 }
 
-function PhoneModal({
+function CommunicationsPage({
+  sessions,
+  details,
+  employees,
+  loading,
+  detailLoading,
+  onOpen,
+  approvals,
+  approvalsLoading,
+  onDecideApproval,
+}: {
+  sessions: A2aFaceToFaceSession[];
+  details: Record<string, A2aCommunicationDetail>;
+  employees: Employee[];
+  loading: boolean;
+  detailLoading: Record<string, boolean>;
+  onOpen: (sessionId: string) => void;
+  approvals: RuntimeToolApprovalSummary[];
+  approvalsLoading: boolean;
+  onDecideApproval: (approvalId: string, decision: 'APPROVE' | 'DENY') => void;
+}): ReactElement {
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const selectedDetail = selectedSessionId ? details[selectedSessionId] : undefined;
+  const employeeById = useMemo(() => new Map(employees.map((employee) => [employee.id, employee])), [employees]);
+
+  useEffect(() => {
+    if (selectedSessionId && !details[selectedSessionId]) onOpen(selectedSessionId);
+  }, [details, onOpen, selectedSessionId]);
+
+  return (
+    <section className="communications-page">
+      <div className="communications-heading">
+        <div>
+          <span className="eyebrow">GOVERNED A2A / FACE TO FACE</span>
+          <h1>员工沟通</h1>
+          <p>只有双方动画角色到达同一场景的指定座位后，A2A 会话才会激活。这里展示消息、任务、轮次、Token 和审计记录。</p>
+        </div>
+        <div className="communications-stat"><strong>{sessions.length}</strong><span>已记录会话</span></div>
+      </div>
+      <RuntimeApprovalPanel approvals={approvals} loading={approvalsLoading} onDecide={onDecideApproval} employeeById={employeeById} />
+      <div className="communications-layout">
+        <div className="communication-session-list">
+          {loading && <div className="communications-empty">正在加载 A2A 会话…</div>}
+          {!loading && sessions.length === 0 && <div className="communications-empty">还没有员工之间的面对面 A2A 会话。创建会话后，双方会从工位走向会议座位。</div>}
+          {sessions.map((session) => {
+            const initiator = employeeById.get(session.initiatorId);
+            const recipient = employeeById.get(session.recipientId);
+            return (
+              <button
+                type="button"
+                className={`communication-session-row ${selectedSessionId === session.id ? 'selected' : ''}`}
+                key={session.id}
+                onClick={() => { setSelectedSessionId(session.id); onOpen(session.id); }}
+              >
+                <div className="communication-session-top"><span className={`communication-status ${session.status.toLowerCase()}`}>{a2aStatusLabel(session.status)}</span><time>{formatTime(session.createdAt)}</time></div>
+                <strong>{initiator?.name ?? session.initiatorId} <i>↔</i> {recipient?.name ?? session.recipientId}</strong>
+                <small>{session.roomId} · {session.turnsUsed}/{session.maxTurns} 轮 · {session.tokensUsed.toLocaleString('zh-CN')}/{session.tokenBudget.toLocaleString('zh-CN')} Token</small>
+                <span className="communication-session-context">{session.contextId}</span>
+              </button>
+            );
+          })}
+        </div>
+        <div className="communication-detail-panel">
+          {!selectedSessionId && <div className="communications-empty detail-empty"><span>◌</span><strong>选择一个 A2A 会话</strong><p>查看双方的完整对话、任务状态和治理审计。</p></div>}
+          {selectedSessionId && !selectedDetail && <div className="communications-empty">{detailLoading[selectedSessionId] ? '正在加载会话详情…' : '暂无会话详情'}</div>}
+          {selectedDetail && <A2aCommunicationDetailView detail={selectedDetail} employeeById={employeeById} />}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function RuntimeApprovalPanel({
+  approvals,
+  loading,
+  onDecide,
+  employeeById,
+}: {
+  approvals: RuntimeToolApprovalSummary[];
+  loading: boolean;
+  onDecide: (approvalId: string, decision: 'APPROVE' | 'DENY') => void;
+  employeeById: Map<string, Employee>;
+}): ReactElement {
+  return (
+    <section className="runtime-approval-panel">
+      <div className="communication-section-heading"><span>运行时工具审批</span><small>{loading ? '加载中…' : `${approvals.length} 项待处理`}</small></div>
+      {approvals.length === 0 && !loading && <p className="communication-muted">没有待审批的高风险工具调用。ADK 会在 bash 等工具真正执行前暂停。</p>}
+      {approvals.map((approval) => (
+        <article className="runtime-approval-row" key={approval.id}>
+          <div className="runtime-approval-copy"><strong>{employeeById.get(approval.employeeId)?.name ?? approval.employeeId} · {approval.toolName}</strong><span>调用 {approval.functionCallId} · {formatTime(approval.createdAt)}</span><code>{approval.argumentsRedacted}</code></div>
+          <div className="runtime-approval-actions"><button className="ghost-button" type="button" onClick={() => onDecide(approval.id, 'DENY')}>拒绝</button><button className="primary-button" type="button" onClick={() => onDecide(approval.id, 'APPROVE')}>批准执行</button></div>
+        </article>
+      ))}
+    </section>
+  );
+}
+
+function A2aCommunicationDetailView({ detail, employeeById }: { detail: A2aCommunicationDetail; employeeById: Map<string, Employee> }): ReactElement {
+  const { session, messages, tasks, audit } = detail;
+  return (
+    <div className="communication-detail">
+      <div className="communication-detail-heading">
+        <div><span className="eyebrow">SESSION DETAIL</span><h2>{employeeById.get(session.initiatorId)?.name ?? session.initiatorId} <i>↔</i> {employeeById.get(session.recipientId)?.name ?? session.recipientId}</h2><p>{session.contextId} · 房间 {session.roomId}</p></div>
+        <span className={`communication-status ${session.status.toLowerCase()}`}>{a2aStatusLabel(session.status)}</span>
+      </div>
+      <div className="communication-metrics"><span><small>轮次</small><strong>{session.turnsUsed} / {session.maxTurns}</strong></span><span><small>Token</small><strong>{session.tokensUsed.toLocaleString('zh-CN')} / {session.tokenBudget.toLocaleString('zh-CN')}</strong></span><span><small>到场激活</small><strong>{session.activatedAt ? formatTime(session.activatedAt) : '未激活'}</strong></span><span><small>结束原因</small><strong>{session.closeReason ?? '—'}</strong></span></div>
+      <div className="communication-detail-scroll">
+        <div className="communication-section"><div className="communication-section-heading"><span>对话时间线</span><small>{messages.length} 条 A2A 消息</small></div>{messages.length === 0 && <p className="communication-muted">会话已建立，但还没有消息。</p>}{messages.map((message) => <A2aMessageBubble key={message.id} message={message} employeeById={employeeById} />)}</div>
+        <div className="communication-section"><div className="communication-section-heading"><span>关联任务</span><small>{tasks.length} 个任务</small></div>{tasks.length === 0 && <p className="communication-muted">暂无关联任务。</p>}{tasks.map((task) => <A2aTaskRow key={task.id} task={task} employeeById={employeeById} />)}</div>
+        <div className="communication-section"><div className="communication-section-heading"><span>治理审计</span><small>{audit.length} 条记录</small></div>{audit.length === 0 && <p className="communication-muted">暂无审计记录。</p>}{audit.map((record) => <div className="communication-audit-row" key={record.id}><time>{formatTime(record.createdAt)}</time><strong>{record.action}</strong><span className={`audit-outcome ${record.outcome.toLowerCase()}`}>{record.outcome}</span><small>{record.actorId ? employeeById.get(record.actorId)?.name ?? record.actorId : '系统'}</small></div>)}</div>
+      </div>
+    </div>
+  );
+}
+
+function A2aMessageBubble({ message, employeeById }: { message: A2aCommunicationMessage; employeeById: Map<string, Employee> }): ReactElement {
+  const content = extractA2aText(message.parts);
+  return <article className={`communication-message ${message.direction.toLowerCase()}`}><div className="communication-message-meta"><strong>{employeeById.get(message.senderId)?.name ?? message.senderId}</strong><span>{message.direction === 'REQUEST' ? '请求' : '响应'} · {message.role}</span><time>{formatTime(message.createdAt)}</time></div><p>{content || '（非文本消息）'}</p><small>messageId: {message.id} · taskId: {message.taskId ?? '—'}</small></article>;
+}
+
+function A2aTaskRow({ task, employeeById }: { task: A2aCommunicationTask; employeeById: Map<string, Employee> }): ReactElement {
+  return <div className="communication-task-row"><div><strong>{task.id}</strong><span>{employeeById.get(task.senderId)?.name ?? task.senderId} → {employeeById.get(task.recipientId)?.name ?? task.recipientId}</span></div><span className={`task-state ${task.state.toLowerCase()}`}>{task.state.replace('TASK_STATE_', '')}</span><time>{formatTime(task.updatedAt)}</time>{task.error && <p>{task.error}</p>}</div>;
+}
+
+function extractA2aText(parts: unknown): string {
+  if (!Array.isArray(parts)) return '';
+  return parts.flatMap((part) => {
+    if (!part || typeof part !== 'object') return [];
+    const text = (part as Record<string, unknown>).text;
+    return typeof text === 'string' ? [text] : [];
+  }).join('\n');
+}
+
+function a2aStatusLabel(status: string): string {
+  switch (status) {
+    case 'GATHERING': return '前往会面';
+    case 'ACTIVE': return '面对面进行中';
+    case 'CLOSED': return '已结束';
+    case 'EXPIRED': return '已过期';
+    default: return status;
+  }
+}
+
+function PhonePanel({
   employee,
   messages,
   bootstrap,
@@ -615,10 +801,10 @@ function PhoneModal({
   }
 
   return (
-    <div className="phone-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <section className="phone-shell" role="dialog" aria-modal="true" aria-label={`${employee.name} 的手机`}>
+    <section className="phone-panel" aria-label={`${employee.name} 的手机`}>
+      <div className="phone-shell">
         <div className="phone-speaker" />
-        <div className="phone-topbar"><span className="phone-time">09:41</span><strong>{employee.name}</strong><button type="button" onClick={onClose} aria-label="关闭">×</button></div>
+        <div className="phone-topbar"><span className="phone-time">09:41</span><strong>{employee.name}</strong><button className="phone-close-button" type="button" onClick={onClose} aria-label="关闭">×</button></div>
         <div className="phone-profile-strip"><span className="phone-avatar" style={{ background: employee.appearance.topColor }}>{employee.name.slice(0, 1)}</span><div><strong>{employee.name}</strong><small>{employee.title} · {STATE_LABELS[employee.currentState]}</small></div><span className={`phone-state ${employee.currentState}`} /></div>
         <div className="phone-tabs">
           {([['messages', '消息'], ['profile', '资料'], ['work', '工作'], ['memory', '记忆']] as const).map(([value, label]) => <button className={tab === value ? 'active' : ''} type="button" key={value} onClick={() => setTab(value)}>{label}{value === 'messages' && employee.unreadCount > 0 && <sup>{employee.unreadCount}</sup>}</button>)}
@@ -634,8 +820,8 @@ function PhoneModal({
           {tab === 'memory' && <MemoryTab memories={memories} />}
         </div>
         <div className="phone-home-indicator" />
-      </section>
-    </div>
+      </div>
+    </section>
   );
 }
 
@@ -730,7 +916,8 @@ function MeetingMessageModal({
 type AppBootstrap = ReturnType<typeof useCompanyStore.getState>['bootstrap'];
 
 function ProfileTab({ employee }: { employee: Employee }): ReactElement {
-  return <div className="phone-tab-page"><div className="phone-fact-grid"><span>姓名<strong>{employee.name}</strong></span><span>年龄<strong>{employee.age} 岁</strong></span><span>性别<strong>{genderLabel(employee.gender)}</strong></span><span>角色<strong>{employee.role}</strong></span></div><div className="phone-section"><div className="section-title">性格</div><div className="trait-row">{employee.personality.traits.map((trait) => <span className="trait-chip" key={trait}>{trait}</span>)}</div><p>{employee.personality.communicationStyle}</p></div><div className="phone-section"><div className="section-title">技能</div><div className="phone-skill-list">{employee.skills.map((skill) => <span key={skill.name}>{skill.name} <small>{skill.level}</small></span>)}</div></div><div className="phone-section"><div className="section-title">模型</div><p>{employee.modelProfile?.name ?? employee.modelConfig.provider} · {employee.modelProfile?.model ?? employee.modelConfig.model}</p></div></div>;
+  const speechHabits = employee.personality.speechHabits ?? [];
+  return <div className="phone-tab-page"><div className="phone-fact-grid"><span>姓名<strong>{employee.name}</strong></span><span>年龄<strong>{employee.age} 岁</strong></span><span>性别<strong>{genderLabel(employee.gender)}</strong></span><span>角色<strong>{employee.role}</strong></span></div><div className="phone-section"><div className="section-title">性格与表达</div><div className="trait-row">{employee.personality.traits.map((trait) => <span className="trait-chip" key={trait}>{trait}</span>)}</div><p>{employee.personality.communicationStyle}</p><div className="speech-habit-list">{speechHabits.map((habit) => <span key={habit}>“{habit}”</span>)}</div></div><div className="phone-section"><div className="section-title">工作方式</div><p>{employee.workStyle || '暂无记录'}</p></div><div className="phone-section"><div className="section-title">技能</div><div className="phone-skill-list">{employee.skills.map((skill) => <span key={skill.name}>{skill.name} <small>{skill.level}</small></span>)}</div></div><div className="phone-section"><div className="section-title">模型</div><p>{employee.modelProfile?.name ?? employee.modelConfig.provider} · {employee.modelProfile?.model ?? employee.modelConfig.model}</p></div></div>;
 }
 
 function WorkTab({ employee, goalTitle, task, jobs }: { employee: Employee; goalTitle?: string; task?: string; jobs: AgentJobSummary[] }): ReactElement {
@@ -754,7 +941,8 @@ function TokenUsageOverview({ usage }: { usage: TokenUsageSummary }): ReactEleme
 function EmployeeProfile({ employee, onOpenPhone, onRequestTermination, onCancelTermination }: { employee: Employee; onOpenPhone: () => void; onRequestTermination: () => void; onCancelTermination: () => void }): ReactElement {
   const focusEmployee = (): void => { window.dispatchEvent(new CustomEvent('office:focus', { detail: employee.id })); };
   const employmentLabel = employee.employmentStatus === 'TERMINATING' ? '离职中' : employee.employmentStatus === 'TERMINATED' ? '已离职' : STATE_LABELS[employee.currentState];
-  return <div className="profile-card"><div className="profile-banner" style={{ background: `linear-gradient(135deg, ${employee.appearance.topColor}, #1e2b3a)` }}><span className="profile-avatar" style={{ background: employee.appearance.skinTone, color: employee.appearance.hairColor }}>{employee.name.slice(0, 1)}</span><div><h3>{employee.name}</h3><span>{employee.title}</span></div><span className={`profile-state ${employee.currentState}`}>{employmentLabel}</span></div><div className="profile-body"><div className="profile-facts"><span>{employee.age} 岁 · {genderLabel(employee.gender)}</span><span>{employee.department}</span></div><div className="profile-section"><div className="section-title">性格特征</div><div className="trait-row">{employee.personality.traits.map((trait) => <span className="trait-chip" key={trait}>{trait}</span>)}</div><p className="profile-quote">“{employee.personality.communicationStyle}”</p></div><div className="profile-section"><div className="section-title">技能档案</div>{employee.skills.slice(0, 4).map((skill) => <div className="skill-row" key={skill.name}><div><span>{skill.name}</span><small>{skill.level}</small></div><div className="skill-track"><span style={{ width: `${skill.level}%` }} /></div></div>)}</div><div className="profile-section current-work"><div className="section-title">当前工作</div><div className="work-status"><span className={`state-dot ${employee.currentState}`} /><strong>{employee.employmentStatus === 'TERMINATED' ? '历史员工' : employmentLabel}</strong><span>· {employee.modelProfile?.model ?? employee.modelConfig.model}</span></div></div><div className="profile-actions"><button className="locate-button" type="button" onClick={focusEmployee}>⌖ 定位</button><button className="phone-button" type="button" onClick={onOpenPhone}>▣ 查看手机</button>{employee.employmentStatus === 'ACTIVE' && <button className="danger-button" type="button" onClick={onRequestTermination}>解雇</button>}{employee.employmentStatus === 'TERMINATING' && <button className="ghost-button" type="button" onClick={onCancelTermination}>恢复在职</button>}</div></div></div>;
+  const speechHabits = employee.personality.speechHabits ?? [];
+  return <div className="profile-card"><div className="profile-banner" style={{ background: `linear-gradient(135deg, ${employee.appearance.topColor}, #1e2b3a)` }}><span className="profile-avatar" style={{ background: employee.appearance.skinTone, color: employee.appearance.hairColor }}>{employee.name.slice(0, 1)}</span><div><h3>{employee.name}</h3><span>{employee.title}</span></div><span className={`profile-state ${employee.currentState}`}>{employmentLabel}</span></div><div className="profile-body"><div className="profile-facts"><span>{employee.age} 岁 · {genderLabel(employee.gender)}</span><span>{employee.department}</span></div><div className="profile-section"><div className="section-title">性格与说话习惯</div><div className="trait-row">{employee.personality.traits.map((trait) => <span className="trait-chip" key={trait}>{trait}</span>)}</div><p className="profile-quote">“{employee.personality.communicationStyle}”</p><div className="speech-habit-list">{speechHabits.map((habit) => <span key={habit}>{habit}</span>)}</div></div><div className="profile-section"><div className="section-title">工作方式</div><p className="profile-quote">{employee.workStyle || '暂无记录'}</p></div><div className="profile-section"><div className="section-title">技能档案</div>{employee.skills.slice(0, 4).map((skill) => <div className="skill-row" key={skill.name}><div><span>{skill.name}</span><small>{skill.level}</small></div><div className="skill-track"><span style={{ width: `${skill.level}%` }} /></div></div>)}</div><div className="profile-section current-work"><div className="section-title">当前工作</div><div className="work-status"><span className={`state-dot ${employee.currentState}`} /><strong>{employee.employmentStatus === 'TERMINATED' ? '历史员工' : employmentLabel}</strong><span>· {employee.modelProfile?.model ?? employee.modelConfig.model}</span></div></div><div className="profile-actions"><button className="locate-button" type="button" onClick={focusEmployee}>⌖ 定位</button><button className="phone-button" type="button" onClick={onOpenPhone}>▣ 查看手机</button>{employee.employmentStatus === 'ACTIVE' && <button className="danger-button" type="button" onClick={onRequestTermination}>解雇</button>}{employee.employmentStatus === 'TERMINATING' && <button className="ghost-button" type="button" onClick={onCancelTermination}>恢复在职</button>}</div></div></div>;
 }
 
 function EventTimeline({ events, employees }: { events: DomainEvent[]; employees: Employee[] }): ReactElement {
@@ -764,6 +952,14 @@ function EventTimeline({ events, employees }: { events: DomainEvent[]; employees
 
 function eventLabel(event: DomainEvent): string {
   const payload = event.payload as Record<string, unknown>;
+  if (event.type === 'runtime.event') {
+    const eventType = typeof payload.eventType === 'string' ? payload.eventType : 'runtime event';
+    const toolName = typeof payload.toolName === 'string' ? ` · ${payload.toolName}` : '';
+    const status = typeof payload.status === 'string' ? ` · ${payload.status}` : '';
+    return `${eventType}${toolName}${status}`;
+  }
+  if (event.type === 'runtime.approval.required') return '高风险工具调用等待审批';
+  if (event.type === 'runtime.approval.decided') return `工具审批已${payload.status === 'APPROVED' ? '批准' : '拒绝'}`;
   if (event.type === 'employee.state.changed' && typeof payload.to === 'string') return `状态 → ${STATE_LABELS[normalizeStateForLabel(payload.to)] ?? payload.to}`;
   if (event.type === 'employee.destination.changed') return '前往新的工作地点';
   if ((event.type === 'message.received' || event.type === 'message.sent') && typeof payload.content === 'string') return payload.content;

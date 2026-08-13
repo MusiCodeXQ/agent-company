@@ -10,6 +10,10 @@ import {
   EMPLOYEE_MESSAGE_PAGE_SIZE,
   fetchEmployeeMemory,
   fetchEmployeeMessages,
+  fetchA2aCommunication,
+  fetchA2aCommunications,
+  fetchRuntimeToolApprovals,
+  decideRuntimeToolApproval,
   fetchSnapshot,
   finishMeeting,
   hireCandidate as hireCandidateApi,
@@ -40,6 +44,7 @@ import {
   type ActiveMovement,
   type AgentMemoryRecord,
   type AgentJobSummary,
+  type A2aFaceToFaceSession,
   type BootstrapResponse,
   type CompanyStoreState,
   type Destination,
@@ -87,6 +92,10 @@ interface CompanyStoreActions {
   testOpenClaw: () => Promise<OpenClawStatus>;
   provisionEmployeeRuntime: (employeeId: string) => Promise<void>;
   provisionEmployeeWorkspace: (employeeId: string) => Promise<void>;
+  loadA2aSessions: () => Promise<void>;
+  loadA2aCommunication: (sessionId: string) => Promise<void>;
+  loadRuntimeToolApprovals: () => Promise<void>;
+  decideRuntimeToolApproval: (approvalId: string, decision: 'APPROVE' | 'DENY') => Promise<void>;
 }
 
 type CompanyStore = CompanyStoreState & CompanyStoreActions;
@@ -107,6 +116,7 @@ function normalizeEmployees(employees: Employee[]): Employee[] {
     device: employee.device ?? 'NONE',
     posture: employee.posture ?? 'SITTING',
     presence: employee.presence ?? 'AVAILABLE',
+    workStyle: employee.workStyle ?? '',
     unreadCount: employee.unreadCount ?? 0,
     tokenUsage: normalizeTokenUsage(employee.tokenUsage),
   }));
@@ -237,6 +247,12 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
   connectionStatus: 'connecting',
   activeFloorId: null,
   terminationPreview: null,
+  a2aSessions: [],
+  a2aCommunications: {},
+  a2aLoading: false,
+  a2aCommunicationLoading: {},
+  runtimeApprovals: [],
+  runtimeApprovalsLoading: false,
 
   loadBootstrap: async (floorId) => {
     try {
@@ -273,6 +289,63 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
     (connectionStatus) => set({ connectionStatus }),
   ),
 
+  loadA2aSessions: async () => {
+    set({ a2aLoading: true });
+    try {
+      const sessions = await fetchA2aCommunications();
+      set({ a2aSessions: sessions, a2aLoading: false });
+    } catch (error) {
+      set({
+        a2aLoading: false,
+        error: error instanceof Error ? error.message : 'Unable to load A2A communications',
+      });
+    }
+  },
+
+  loadA2aCommunication: async (sessionId) => {
+    set((state) => ({
+      a2aCommunicationLoading: { ...state.a2aCommunicationLoading, [sessionId]: true },
+    }));
+    try {
+      const detail = await fetchA2aCommunication(sessionId);
+      set((state) => ({
+        a2aCommunications: { ...state.a2aCommunications, [sessionId]: detail },
+        a2aSessions: state.a2aSessions.some((item) => item.id === detail.session.id)
+          ? state.a2aSessions.map((item) => (item.id === detail.session.id ? detail.session : item))
+          : [detail.session, ...state.a2aSessions],
+        a2aCommunicationLoading: { ...state.a2aCommunicationLoading, [sessionId]: false },
+      }));
+    } catch (error) {
+      set((state) => ({
+        a2aCommunicationLoading: { ...state.a2aCommunicationLoading, [sessionId]: false },
+        error: error instanceof Error ? error.message : 'Unable to load A2A communication detail',
+      }));
+    }
+  },
+
+  loadRuntimeToolApprovals: async () => {
+    set({ runtimeApprovalsLoading: true });
+    try {
+      const runtimeApprovals = await fetchRuntimeToolApprovals();
+      set({ runtimeApprovals, runtimeApprovalsLoading: false });
+    } catch (error) {
+      set({
+        runtimeApprovalsLoading: false,
+        error: error instanceof Error ? error.message : 'Unable to load runtime approvals',
+      });
+    }
+  },
+
+  decideRuntimeToolApproval: async (approvalId, decision) => {
+    try {
+      await decideRuntimeToolApproval(approvalId, decision);
+      await get().loadRuntimeToolApprovals();
+    } catch (error) {
+      set({ error: error instanceof Error ? error.message : 'Unable to decide runtime approval' });
+      throw error;
+    }
+  },
+
   applyEvent: (event) => {
     set((state) => {
       const nextEvents = state.events.some((item) => item.eventId === event.eventId)
@@ -289,6 +362,28 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
       let workstations = state.bootstrap?.workstations ?? [];
       let hiringRequests = state.bootstrap?.hiringRequests ?? [];
       let environmentSuggestions = state.bootstrap?.environmentSuggestions ?? [];
+      let a2aSessions = state.a2aSessions;
+
+      if (event.type === 'a2a.face_to_face.gathering' && payload.session && typeof payload.session === 'object') {
+        const session = payload.session as A2aFaceToFaceSession;
+        a2aSessions = state.a2aSessions.some((item) => item.id === session.id)
+          ? state.a2aSessions.map((item) => (item.id === session.id ? session : item))
+          : [session, ...state.a2aSessions];
+      }
+      if (
+        (event.type === 'a2a.face_to_face.activated' || event.type === 'a2a.face_to_face.closed')
+        && typeof payload.sessionId === 'string'
+      ) {
+        const sessionId = payload.sessionId;
+        a2aSessions = a2aSessions.map((session) => session.id !== sessionId
+          ? session
+          : {
+            ...session,
+            status: event.type === 'a2a.face_to_face.activated' ? 'ACTIVE' : 'CLOSED',
+            closedAt: event.type === 'a2a.face_to_face.closed' ? event.timestamp : session.closedAt,
+            closeReason: typeof payload.reason === 'string' ? payload.reason : session.closeReason,
+          });
+      }
 
       if (event.type === 'employee.state.changed' && event.actorId && typeof payload.to === 'string') {
         const nextState = normalizeActorState(payload.to);
@@ -523,11 +618,35 @@ export const useCompanyStore = create<CompanyStore>((set, get) => ({
           serverTime: event.timestamp,
         }
         : state.bootstrap;
-      return { bootstrap, employees, messages, activeMovements, serverTime: event.timestamp, events: nextEvents };
+      return {
+        bootstrap,
+        employees,
+        messages,
+        activeMovements,
+        a2aSessions,
+        serverTime: event.timestamp,
+        events: nextEvents,
+      };
     });
+    if (event.type.startsWith('a2a.')) {
+      void get().loadA2aSessions();
+      if (event.type.includes('message') || event.type.includes('task') || event.type.includes('face_to_face')) {
+        Object.keys(get().a2aCommunications).forEach((sessionId) => {
+          void get().loadA2aCommunication(sessionId);
+        });
+      }
+    }
+    if (event.type === 'runtime.approval.required' || event.type === 'runtime.approval.decided') {
+      void get().loadRuntimeToolApprovals();
+    }
   },
 
-  selectEmployee: (employeeId) => set({ selectedEmployeeId: employeeId }),
+  selectEmployee: (employeeId) => set((state) => ({
+    selectedEmployeeId: employeeId,
+    // Re-focusing the employee whose phone is open keeps the phone pose;
+    // moving focus to any other employee releases it.
+    phoneEmployeeId: state.phoneEmployeeId === employeeId ? state.phoneEmployeeId : null,
+  })),
 
   openPhone: async (employeeId) => {
     set({ selectedEmployeeId: employeeId, phoneEmployeeId: employeeId });

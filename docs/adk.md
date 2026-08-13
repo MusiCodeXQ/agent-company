@@ -127,6 +127,8 @@ ADK 只能表达“我想去找 B”或“我想去会议室”这类高层意�
 
 禁止让 ADK 的 A2A、子 Agent 或 MCP 绕过 Company Message Bus 进行正式员工通信，否则管理员看不到，也无法关联任务和阻止无限互聊。
 
+项目支持由 Company A2A Gateway 托管的标准 A2A HTTP+JSON 接口，但这不属于绕行路径。面对面 A2A 必须先创建持久化会话，由 Spatial Simulation 为双方预约同一房间内的不同座位并驱动移动；只有后端确认双方均已到场后，短期 capability token 才能用于 `message:send`。每次发送都会重新校验位置、发言顺序、轮数、Token 预算和过期时间，并把 A2A Message、Task、公司 Message、Agent Job 和审计记录关联写入 SQLite。任一员工离开会面座位时，会话立即关闭。
+
 ### 4.4 工作管理
 
 - Goal → Task → Agent Job 的关系与状态。

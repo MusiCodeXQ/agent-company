@@ -3,7 +3,8 @@ use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
 
 use crate::models::{
-    RuntimeEnvironmentSuggestionSummary, RuntimeWorkspaceSummary, TokenUsageSummary,
+    RuntimeEnvironmentSuggestionSummary, RuntimeToolApprovalSummary, RuntimeWorkspaceSummary,
+    TokenUsageSummary,
 };
 
 #[derive(Debug, FromRow)]
@@ -258,34 +259,278 @@ pub async fn finish_run(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn record_tool_call(
     pool: &SqlitePool,
     run_id: &str,
     employee_id: &str,
     tool_name: &str,
+    function_call_id: Option<&str>,
     arguments_redacted: &str,
     status: &str,
     result_summary: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     let now = Utc::now().to_rfc3339();
+    let completed_at = (status == "COMPLETED").then_some(now.clone());
+    if let Some(function_call_id) = function_call_id {
+        let updated = sqlx::query(
+            "UPDATE runtime_tool_calls
+             SET tool_name = ?,
+                 arguments_redacted = CASE WHEN ? = '{}' THEN arguments_redacted ELSE ? END,
+                 status = ?, completed_at = COALESCE(?, completed_at),
+                 result_summary = COALESCE(?, result_summary)
+             WHERE run_id = ? AND function_call_id = ?",
+        )
+        .bind(tool_name)
+        .bind(arguments_redacted)
+        .bind(arguments_redacted)
+        .bind(status)
+        .bind(completed_at.as_deref())
+        .bind(result_summary)
+        .bind(run_id)
+        .bind(function_call_id)
+        .execute(pool)
+        .await?;
+        if updated.rows_affected() > 0 {
+            return Ok(());
+        }
+    }
     sqlx::query(
         "INSERT INTO runtime_tool_calls
-         (id, run_id, employee_id, tool_name, arguments_redacted, status,
+         (id, run_id, employee_id, function_call_id, tool_name, arguments_redacted, status,
           approval_status, started_at, completed_at, result_summary)
-         VALUES (?, ?, ?, ?, ?, ?, 'NOT_REQUIRED', ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'NOT_REQUIRED', ?, ?, ?)",
     )
     .bind(format!("runtime-tool-call-{}", Uuid::new_v4()))
     .bind(run_id)
     .bind(employee_id)
+    .bind(function_call_id)
     .bind(tool_name)
     .bind(arguments_redacted)
     .bind(status)
     .bind(&now)
-    .bind(&now)
+    .bind(completed_at.as_deref())
     .bind(result_summary)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_tool_approval(
+    pool: &SqlitePool,
+    company_id: &str,
+    run_id: &str,
+    agent_job_id: &str,
+    employee_id: &str,
+    function_call_id: &str,
+    tool_name: &str,
+    arguments_redacted: &str,
+    arguments_fingerprint: &str,
+) -> Result<String, sqlx::Error> {
+    let id = format!("runtime-approval-{}", Uuid::new_v4());
+    let now = Utc::now();
+    let expires_at = (now + chrono::Duration::minutes(30)).to_rfc3339();
+    sqlx::query(
+        "INSERT INTO runtime_tool_approvals
+         (id, company_id, run_id, agent_job_id, employee_id, function_call_id,
+          tool_name, arguments_redacted, arguments_fingerprint, status, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
+         ON CONFLICT(run_id, function_call_id) DO NOTHING",
+    )
+    .bind(&id)
+    .bind(company_id)
+    .bind(run_id)
+    .bind(agent_job_id)
+    .bind(employee_id)
+    .bind(function_call_id)
+    .bind(tool_name)
+    .bind(arguments_redacted)
+    .bind(arguments_fingerprint)
+    .bind(now.to_rfc3339())
+    .bind(&expires_at)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE runtime_tool_calls SET approval_status = 'PENDING', function_call_id = ?
+         WHERE run_id = ? AND tool_name = ? AND approval_status = 'NOT_REQUIRED'",
+    )
+    .bind(function_call_id)
+    .bind(run_id)
+    .bind(tool_name)
+    .execute(pool)
+    .await?;
+    let approval_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM runtime_tool_approvals WHERE run_id = ? AND function_call_id = ?",
+    )
+    .bind(run_id)
+    .bind(function_call_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(approval_id)
+}
+
+pub async fn pending_tool_approvals(
+    pool: &SqlitePool,
+    company_id: &str,
+) -> Result<Vec<RuntimeToolApprovalSummary>, sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE runtime_tool_approvals
+         SET status = 'EXPIRED', decided_at = ?
+         WHERE company_id = ? AND status = 'PENDING' AND expires_at <= ?",
+    )
+    .bind(&now)
+    .bind(company_id)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    let rows = sqlx::query_as::<_, RuntimeToolApprovalRow>(
+        "SELECT id, company_id, run_id, agent_job_id, employee_id, function_call_id,
+                tool_name, arguments_redacted, arguments_fingerprint, status,
+                decided_by, decision_reason, created_at, expires_at, decided_at
+         FROM runtime_tool_approvals
+         WHERE company_id = ? AND status = 'PENDING'
+         ORDER BY created_at DESC, id DESC",
+    )
+    .bind(company_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(approval_from_row).collect())
+}
+
+pub async fn decide_tool_approval(
+    pool: &SqlitePool,
+    company_id: &str,
+    approval_id: &str,
+    decision: &str,
+    decided_by: &str,
+    reason: Option<&str>,
+) -> Result<Option<RuntimeToolApprovalSummary>, sqlx::Error> {
+    let decision = decision.to_ascii_uppercase();
+    if !matches!(decision.as_str(), "APPROVED" | "DENIED") {
+        return Ok(None);
+    }
+    let now = Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE runtime_tool_approvals SET status = 'EXPIRED', decided_at = ?
+         WHERE id = ? AND company_id = ? AND status = 'PENDING' AND expires_at <= ?",
+    )
+    .bind(&now)
+    .bind(approval_id)
+    .bind(company_id)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    let row = sqlx::query_as::<_, RuntimeToolApprovalRow>(
+        "SELECT id, company_id, run_id, agent_job_id, employee_id, function_call_id,
+                tool_name, arguments_redacted, arguments_fingerprint, status,
+                decided_by, decision_reason, created_at, expires_at, decided_at
+         FROM runtime_tool_approvals
+         WHERE id = ? AND company_id = ? AND status = 'PENDING' AND expires_at > ?",
+    )
+    .bind(approval_id)
+    .bind(company_id)
+    .bind(&now)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    sqlx::query(
+        "UPDATE runtime_tool_approvals
+         SET status = ?, decided_by = ?, decision_reason = ?, decided_at = ?
+         WHERE id = ? AND status = 'PENDING'",
+    )
+    .bind(&decision)
+    .bind(decided_by)
+    .bind(reason)
+    .bind(&now)
+    .bind(approval_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE runtime_tool_calls SET approval_status = ?, completed_at = ?
+         WHERE run_id = ? AND function_call_id = ?",
+    )
+    .bind(&decision)
+    .bind(&now)
+    .bind(&row.run_id)
+    .bind(&row.function_call_id)
+    .execute(&mut *tx)
+    .await?;
+    let current_payload =
+        sqlx::query_scalar::<_, String>("SELECT payload FROM agent_jobs WHERE id = ?")
+            .bind(&row.agent_job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let mut payload = serde_json::from_str::<serde_json::Value>(&current_payload)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    payload["toolApproval"] = serde_json::json!({
+        "callId": row.function_call_id,
+        "decision": if decision == "APPROVED" { "approve" } else { "deny" },
+        "fingerprint": row.arguments_fingerprint,
+    });
+    let payload = payload.to_string();
+    sqlx::query(
+        "UPDATE agent_jobs SET status = 'PENDING', payload = ?,
+                available_at = ?, updated_at = ?, error = NULL
+         WHERE id = ? AND status IN ('WAITING', 'WAITING_APPROVAL', 'RUNNING')",
+    )
+    .bind(payload)
+    .bind(&now)
+    .bind(&now)
+    .bind(&row.agent_job_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(approval_from_row(RuntimeToolApprovalRow {
+        status: decision,
+        decided_by: Some(decided_by.to_string()),
+        decision_reason: reason.map(str::to_string),
+        decided_at: Some(now),
+        ..row
+    })))
+}
+
+#[derive(Debug, FromRow)]
+struct RuntimeToolApprovalRow {
+    id: String,
+    company_id: String,
+    run_id: String,
+    agent_job_id: String,
+    employee_id: String,
+    function_call_id: String,
+    tool_name: String,
+    arguments_redacted: String,
+    arguments_fingerprint: String,
+    status: String,
+    decided_by: Option<String>,
+    decision_reason: Option<String>,
+    created_at: String,
+    expires_at: String,
+    decided_at: Option<String>,
+}
+
+fn approval_from_row(row: RuntimeToolApprovalRow) -> RuntimeToolApprovalSummary {
+    RuntimeToolApprovalSummary {
+        id: row.id,
+        company_id: row.company_id,
+        run_id: row.run_id,
+        agent_job_id: row.agent_job_id,
+        employee_id: row.employee_id,
+        function_call_id: row.function_call_id,
+        tool_name: row.tool_name,
+        arguments_redacted: row.arguments_redacted,
+        arguments_fingerprint: row.arguments_fingerprint,
+        status: row.status,
+        decided_by: row.decided_by,
+        decision_reason: row.decision_reason,
+        created_at: row.created_at,
+        expires_at: row.expires_at,
+        decided_at: row.decided_at,
+    }
 }
 
 fn workspace_from_row(row: RuntimeWorkspaceRow) -> RuntimeWorkspaceSummary {

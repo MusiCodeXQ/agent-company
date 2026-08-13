@@ -62,12 +62,14 @@ export function OfficeCanvas({ onMeetingTableClick }: { onMeetingTableClick?: ()
         engine.setEmployees(state.employees);
         engine.setMovements(state.activeMovements, state.serverTime);
         engine.setSelectedEmployee(state.selectedEmployeeId);
+        engine.setPhoneEmployee(state.phoneEmployeeId);
 
         unsubscribe = useCompanyStore.subscribe((nextState) => {
           engine?.setOffice(nextState.bootstrap?.office ?? defaultOffice);
           engine?.setEmployees(nextState.employees);
           engine?.setMovements(nextState.activeMovements, nextState.serverTime);
           engine?.setSelectedEmployee(nextState.selectedEmployeeId);
+          engine?.setPhoneEmployee(nextState.phoneEmployeeId);
         });
       } catch (error) {
         if (!disposed) console.error('Unable to initialize the office renderer', error);

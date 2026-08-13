@@ -96,6 +96,7 @@ export class AgentActor extends Container {
   private readonly onSelect: (employeeId: string) => void;
   private readonly onOpenPhone: (employeeId: string) => void;
   private lastTapAt = 0;
+  private phoneOpen = false;
 
   constructor(
     employee: Employee,
@@ -186,9 +187,11 @@ export class AgentActor extends Container {
     selected: boolean,
     movement: ActiveMovement | null = null,
     serverTime?: string | null,
+    phoneOpen = false,
   ): void {
     const stateChanged = this.state !== employee.currentState;
-    const appearanceChanged = this.employee.appearance.seed !== employee.appearance.seed;
+    const appearanceChanged = this.employee.appearance.seed !== employee.appearance.seed
+      || this.employee.gender !== employee.gender;
     const movementChanged = this.movement?.id !== movement?.id
       || this.movement?.movementStatus !== movement?.movementStatus
       || this.movement?.estimatedArrivalAt !== movement?.estimatedArrivalAt;
@@ -196,6 +199,7 @@ export class AgentActor extends Container {
     this.office = office;
     this.state = employee.currentState;
     this.movement = movement;
+    this.phoneOpen = phoneOpen;
     if (serverTime) {
       const parsed = Date.parse(serverTime);
       if (Number.isFinite(parsed)) this.serverTimeOffsetMs = parsed - Date.now();
@@ -249,7 +253,7 @@ export class AgentActor extends Container {
   }
 
   private poseMode(): AgentPose {
-    if (this.employee.device === 'PHONE' || this.state === 'checking_phone') return 'phone';
+    if (this.phoneOpen || this.employee.device === 'PHONE' || this.state === 'checking_phone') return 'phone';
     if (this.employee.device === 'COMPUTER' || ['CODING', 'TESTING'].includes(this.employee.activity)) return 'typing';
     if (this.employee.activity === 'THINKING' || this.state === 'thinking') return 'thinking';
     if (this.employee.activity === 'TALKING') return 'talking';
@@ -285,7 +289,7 @@ export class AgentActor extends Container {
     this.drawArm(this.leftArm, shade(top, -8), skin, outline);
     this.drawArm(this.rightArm, top, skin, outline);
     this.drawTorso(bodyWidth, top, skin, outline, appearance.topStyle, appearance.accessory);
-    this.drawHead(skin, hair, outline, appearance.hairStyle, appearance.glasses, appearance.beardStyle, appearance.accessory);
+    this.drawHead(skin, hair, outline, appearance.hairStyle, appearance.glasses, appearance.beardStyle, appearance.accessory, this.employee.gender);
 
     this.phone
       .clear()
@@ -417,31 +421,66 @@ export class AgentActor extends Container {
     glasses: boolean,
     beardStyle: string | undefined,
     accessory: string,
+    gender: Employee['gender'],
   ): void {
     const head = new Graphics();
     if (style === 'bob' || style === 'wave') {
       head
-        .circle(0, -1, 16.5)
+        .ellipse(0, 0, 15.5, 17)
         .fill(shade(hairColor, -8))
-        .roundRect(-16, -2, 5, 22, 3)
+        .roundRect(-15, -2, 4.5, 20, 3)
         .fill(hairColor)
-        .roundRect(11, -2, 5, 22, 3)
+        .roundRect(10.5, -2, 4.5, 20, 3)
         .fill(hairColor);
     }
+    const faceHalfWidth = gender === 'male' ? 12.7 : gender === 'female' ? 11.8 : 12.2;
+    const eyeColor = gender === 'female' ? 0x30282a : 0x252b30;
     head
-      .circle(0, 0, 14)
+      .circle(-faceHalfWidth, 1, 2.5)
+      .fill(shade(skinColor, -8))
+      .circle(faceHalfWidth, 1, 2.5)
+      .fill(shade(skinColor, -8))
+      .ellipse(0, 0, faceHalfWidth, 14.4)
       .fill(skinColor)
       .stroke({ color: outline, width: 1.2 })
-      .ellipse(-5, 1, 1.2, 1.6)
-      .fill(0x20252a)
-      .ellipse(5, 1, 1.2, 1.6)
-      .fill(0x20252a)
-      .rect(-1, 6, 3, 1)
-      .fill({ color: shade(skinColor, -45), alpha: 0.7 })
-      .circle(-9, 6, 2.4)
+      .moveTo(-8.2, -4)
+      .quadraticCurveTo(-5.3, -5.6, -2.7, -4.1)
+      .moveTo(2.7, -4.1)
+      .quadraticCurveTo(5.3, -5.6, 8.2, -4)
+      .stroke({ color: shade(hairColor, -18), width: gender === 'male' ? 1.35 : 0.9, cap: 'round' })
+      .ellipse(-5.2, 0, 2.45, 1.75)
+      .fill(0xf5eee6)
+      .ellipse(5.2, 0, 2.45, 1.75)
+      .fill(0xf5eee6)
+      .circle(-5.2, 0.1, 1.25)
+      .fill(eyeColor)
+      .circle(5.2, 0.1, 1.25)
+      .fill(eyeColor)
+      .circle(-4.8, -0.35, 0.38)
+      .fill(0xffffff)
+      .circle(5.6, -0.35, 0.38)
+      .fill(0xffffff)
+      .moveTo(0, 1.4)
+      .quadraticCurveTo(-1.2, 4.3, 0.8, 4.5)
+      .stroke({ color: shade(skinColor, -38), width: 0.85, cap: 'round' })
+      .moveTo(-3.4, 8)
+      .quadraticCurveTo(0, 10, 3.6, 7.8)
+      .stroke({ color: shade(skinColor, -58), width: 1.05, cap: 'round' })
+      .circle(-8.5, 5.5, 2.4)
       .fill({ color: 0xf09b93, alpha: 0.14 })
-      .circle(9, 6, 2.4)
+      .circle(8.5, 5.5, 2.4)
       .fill({ color: 0xf09b93, alpha: 0.14 });
+
+    if (gender === 'female') {
+      head
+        .moveTo(-7.7, -0.8).lineTo(-9.2, -1.7)
+        .moveTo(7.7, -0.8).lineTo(9.2, -1.7)
+        .stroke({ color: eyeColor, width: 0.85, cap: 'round' });
+    } else if (gender === 'male') {
+      head
+        .moveTo(-8.5, 9.5).quadraticCurveTo(0, 14.6, 8.5, 9.5)
+        .stroke({ color: shade(skinColor, -25), width: 0.65, alpha: 0.5 });
+    }
 
     this.drawHair(head, style, hairColor);
     if (beardStyle) {
@@ -471,10 +510,10 @@ export class AgentActor extends Container {
         .fill(0x77cfee);
     }
     const backHead = new Graphics()
-      .circle(0, 0, 14.5)
+      .ellipse(0, 0, 13.3, 15)
       .fill(shade(hairColor, -5))
       .stroke({ color: outline, width: 1.2 })
-      .arc(0, -1, 10.5, Math.PI + 0.3, Math.PI * 2 - 0.3)
+      .arc(0, -1, 10.2, Math.PI + 0.3, Math.PI * 2 - 0.3)
       .stroke({ color: shade(hairColor, 28), width: 2, alpha: 0.5 })
       .rect(-8, 8, 16, 4)
       .fill({ color: shade(hairColor, -18), alpha: 0.9 });
@@ -502,13 +541,15 @@ export class AgentActor extends Container {
     }
     if (style === 'bob' || style === 'wave') {
       graphics
-        .arc(0, -1, 14.8, Math.PI + 0.12, Math.PI * 2 - 0.12)
-        .stroke({ color, width: 8, cap: 'round' })
-        .roundRect(-13, -9, 6, 13, 3)
+        // Keep the front fringe above the brows.  A wide arc centered at y=-1
+        // extends into the eye band (y≈0), especially after Pixi scaling.
+        .roundRect(-12.5, -15, 25, 6, 3)
         .fill(color)
-        .roundRect(7, -9, 6, 13, 3)
+        .roundRect(-13.5, -11, 4.5, 7, 2.2)
+        .fill(color)
+        .roundRect(9, -11, 4.5, 7, 2.2)
         .fill(color);
-      if (style === 'wave') graphics.circle(11, 4, 4).fill(color);
+      if (style === 'wave') graphics.circle(12, -5.5, 3.2).fill(color);
       return;
     }
     graphics

@@ -71,6 +71,7 @@ export class OfficeEngine {
   private movements = new Map<string, ActiveMovement>();
   private serverTime: string | null = null;
   private selectedEmployeeId: string | null = null;
+  private phoneEmployeeId: string | null = null;
   private scale = 1;
   private dragging = false;
   private lastPointer = { x: 0, y: 0 };
@@ -150,6 +151,7 @@ export class OfficeEngine {
           employee.id === this.selectedEmployeeId,
           this.movements.get(employee.id) ?? null,
           this.serverTime,
+          employee.id === this.phoneEmployeeId,
         );
       } else {
         const actor = new AgentActor(employee, this.office, this.onSelect, this.onOpenPhone);
@@ -159,6 +161,7 @@ export class OfficeEngine {
           employee.id === this.selectedEmployeeId,
           this.movements.get(employee.id) ?? null,
           this.serverTime,
+          employee.id === this.phoneEmployeeId,
         );
         this.actors.set(employee.id, actor);
         this.depthLayer.addChild(actor);
@@ -178,6 +181,7 @@ export class OfficeEngine {
         employee.id === this.selectedEmployeeId,
         this.movements.get(employee.id) ?? null,
         this.serverTime,
+        employee.id === this.phoneEmployeeId,
       );
     }
   }
@@ -192,6 +196,23 @@ export class OfficeEngine {
         employee.id === employeeId,
         this.movements.get(employee.id) ?? null,
         this.serverTime,
+        employee.id === this.phoneEmployeeId,
+      );
+    }
+  }
+
+  setPhoneEmployee(employeeId: string | null): void {
+    if (this.phoneEmployeeId === employeeId) return;
+    this.phoneEmployeeId = employeeId;
+    if (!this.office) return;
+    for (const employee of this.employees) {
+      this.actors.get(employee.id)?.syncEmployee(
+        employee,
+        this.office,
+        employee.id === this.selectedEmployeeId,
+        this.movements.get(employee.id) ?? null,
+        this.serverTime,
+        employee.id === employeeId,
       );
     }
   }
@@ -366,7 +387,7 @@ export class OfficeEngine {
     if (room.type === 'workspace') {
       const subtitle = new Text({
         text: 'LIVE AGENT FLOOR',
-        style: { fill: palette.accent, fontSize: 8, fontWeight: '700', letterSpacing: 1.5 },
+        style: { fill: palette.accent, fontSize: 10, fontWeight: '700', letterSpacing: 1.5 },
       });
       subtitle.position.set(plateWidth + 10, 5);
       labelContainer.addChild(subtitle);
@@ -431,10 +452,10 @@ export class OfficeEngine {
 
     const badge = new Container();
     const badgeSurface = new Graphics()
-      .roundRect(0, 0, 88, 28, 4)
+      .roundRect(0, 0, 88, 32, 4)
       .fill({ color: 0xf1d58d, alpha: 0.96 })
       .stroke({ color: 0x6d522a, width: 1, alpha: 0.95 })
-      .roundRect(3, 3, 82, 22, 2)
+      .roundRect(3, 3, 82, 26, 2)
       .fill({ color: 0x18252b, alpha: 0.94 })
       .stroke({ color: 0xf0ca70, width: 0.7, alpha: 0.72 })
       .circle(8, 8, 2)
@@ -446,7 +467,7 @@ export class OfficeEngine {
       style: {
         fill: 0xfff1c6,
         fontFamily: 'ui-sans-serif, system-ui, sans-serif',
-        fontSize: 9,
+        fontSize: 11,
         fontWeight: '800',
       },
     });
@@ -461,7 +482,7 @@ export class OfficeEngine {
         letterSpacing: 0.15,
       },
     });
-    badgeTitle.position.set(14, 15);
+    badgeTitle.position.set(14, 19);
     badge.addChild(badgeSurface, badgeName, badgeTitle);
     const badgeAnchor = projectPoint({ x: desk.x + 12, y: desk.y + 50 });
     badge.position.set(badgeAnchor.x, badgeAnchor.y - 12);
@@ -625,7 +646,7 @@ export class OfficeEngine {
         text: furniture.label,
         style: {
           fill: 0xf4d7a4,
-          fontSize: 9,
+          fontSize: 11,
           fontWeight: '800',
           letterSpacing: 1.2,
           dropShadow: { color: 0x080a0b, alpha: 0.8, blur: 2, distance: 1 },
@@ -668,15 +689,15 @@ export class OfficeEngine {
     const legend = new Container();
     legend.position.set(position.x, position.y);
     const panel = new Graphics()
-      .roundRect(0, 0, 476, 46, 8)
+      .roundRect(0, 0, 476, 50, 8)
       .fill({ color: 0x0e1519, alpha: 0.9 })
       .stroke({ color: 0x8c826c, width: 1, alpha: 0.42 })
-      .rect(0, 0, 4, 46)
+      .rect(0, 0, 4, 50)
       .fill(0xd3ac67);
     legend.addChild(panel);
     const title = new Text({
       text: 'LIVE OFFICE',
-      style: { fill: 0xe7d9bd, fontSize: 9, fontWeight: '800', letterSpacing: 1.4 },
+      style: { fill: 0xe7d9bd, fontSize: 11, fontWeight: '800', letterSpacing: 1.4 },
     });
     title.position.set(15, 8);
     legend.addChild(title);

@@ -9,6 +9,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb2571ee7d3afe8b8dd9e56065255d996b8d2349873414a5d9fd9761c5ac0096"
 dependencies = [
  "adk-core",
+ "adk-plugin",
  "adk-skill",
  "adk-telemetry",
  "async-stream",
@@ -737,14 +738,17 @@ dependencies = [
  "adk-core",
  "adk-devtools",
  "adk-model",
+ "adk-plugin",
  "adk-runner",
  "adk-session",
  "adk-tool",
  "anyhow",
+ "chrono",
  "futures",
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

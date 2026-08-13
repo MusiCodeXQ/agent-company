@@ -209,6 +209,20 @@ npm run dev -- --host 0.0.0.0
 
 浏览器不会直接调用 LLM，也不会收到 Provider 的完整 API Key。
 
+## 受治理的面对面 A2A
+
+员工之间可使用 A2A HTTP+JSON 协议协作，但不能彼此直连。所有请求必须经过 Company A2A Gateway，并且只有两个动画角色被后端确认到达同一会议室内各自预约的座位后才会激活会话。
+
+```text
+POST /api/companies/:companyId/a2a/face-to-face-sessions
+GET  /api/companies/:companyId/a2a/agents/:agentId/.well-known/agent-card.json
+POST /api/companies/:companyId/a2a/agents/:agentId/message:send
+GET  /api/companies/:companyId/a2a/tasks/:taskId
+POST /api/companies/:companyId/a2a/tasks/:taskId:cancel
+```
+
+创建会话会返回一次性的明文 capability token；数据库只保存其 SHA-256 摘要。后续 A2A 请求需要 `Authorization: Bearer <token>`、`X-A2A-Sender-Id` 和 `A2A-Version: 1.0`。网关持久化消息、Task、Artifact、公司 Job 与审计记录，并执行到场、交替发言、最大轮数、Token 预算和会话超时限制。任何参与者离开指定座位都会立即关闭会话。
+
 ## 可选：员工 Docker Runtime
 
 构建基础镜像：

@@ -30,6 +30,7 @@ struct EmployeeRow {
     is_floor_administrator: i64,
     personality: String,
     skills: String,
+    work_style: String,
     appearance: String,
     model_config: String,
     model_profile_id: Option<String>,
@@ -80,7 +81,7 @@ struct CompanyRow {
 pub struct LlmCallInput<'a> {
     pub company_id: &'a str,
     pub employee_id: &'a str,
-    pub job_id: &'a str,
+    pub job_id: Option<&'a str>,
     pub model_profile_id: &'a str,
     pub model: &'a str,
     pub status: &'a str,
@@ -203,9 +204,9 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT OR IGNORE INTO employees
              (id, company_id, name, age, gender, role, department, title, status,
-              personality, skills, appearance, model_config, model_profile_id,
+              personality, skills, work_style, appearance, model_config, model_profile_id,
               desk_id, hired_at, current_state, is_floor_administrator)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&employee.id)
         .bind(&employee.company_id)
@@ -218,6 +219,7 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .bind(&employee.status)
         .bind(personality)
         .bind(skills)
+        .bind(&employee.work_style)
         .bind(appearance)
         .bind(model_config)
         .bind("mock-profile-01")
@@ -230,7 +232,20 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     }
 
     for employee in default_employees() {
-        ensure_employee_runtime_binding(pool, "company-01", &employee.id).await?;
+        // An existing database may already have a different active company
+        // administrator.  `INSERT OR IGNORE` above intentionally leaves that
+        // history untouched, so only create a runtime binding when this seed
+        // row actually exists.
+        let exists: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM employees
+             WHERE company_id = 'company-01' AND id = ? AND employment_status = 'ACTIVE'",
+        )
+        .bind(&employee.id)
+        .fetch_optional(pool)
+        .await?;
+        if exists.is_some() {
+            ensure_employee_runtime_binding(pool, "company-01", &employee.id).await?;
+        }
     }
 
     for location in &office_layout.locations {
@@ -258,7 +273,8 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .await?;
     sqlx::query(
         "UPDATE employees SET floor_id = 'floor-01'
-         WHERE company_id = 'company-01' AND floor_id IS NULL",
+         WHERE company_id = 'company-01' AND floor_id IS NULL
+           AND employment_status = 'ACTIVE'",
     )
     .execute(pool)
     .await?;
@@ -272,12 +288,41 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             .and_then(|location| location.room_id.clone())
             .unwrap_or_else(|| "open-office".to_string());
         let assigned_employee_id = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM employees WHERE company_id = 'company-01' AND id = ?",
+            "SELECT id FROM employees
+             WHERE company_id = 'company-01' AND id = ? AND employment_status = 'ACTIVE'",
         )
         .bind(&desk.employee_id)
         .fetch_optional(pool)
         .await?;
-        let workstation_status = if assigned_employee_id.is_some() {
+        let existing_assignment = sqlx::query_scalar::<_, String>(
+            "SELECT assigned_employee_id FROM workstations
+             WHERE company_id = 'company-01' AND id = ? AND assigned_employee_id IS NOT NULL",
+        )
+        .bind(&desk.id)
+        .fetch_optional(pool)
+        .await?;
+        let existing_assignment_is_active =
+            if let Some(employee_id) = existing_assignment.as_deref() {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM employees
+                 WHERE company_id = 'company-01' AND id = ? AND employment_status = 'ACTIVE'",
+                )
+                .bind(employee_id)
+                .fetch_one(pool)
+                .await?
+                    > 0
+            } else {
+                false
+            };
+        // Existing active assignments (including hired employees) are
+        // authoritative. Only fill an empty workstation from the bootstrap
+        // seed, and release assignments that point at terminated history.
+        let effective_assignment = if existing_assignment_is_active {
+            existing_assignment
+        } else {
+            assigned_employee_id
+        };
+        let workstation_status = if effective_assignment.is_some() {
             "OCCUPIED"
         } else {
             "AVAILABLE"
@@ -294,16 +339,21 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .bind(f64::from(desk.x))
         .bind(f64::from(desk.y))
         .bind(workstation_status)
-        .bind(&assigned_employee_id)
+        .bind(&effective_assignment)
         .bind(&now)
         .bind(&now)
         .execute(pool)
         .await?;
         sqlx::query(
             "UPDATE workstations SET assigned_employee_id = ?, status = ?, updated_at = ?
-             WHERE company_id = 'company-01' AND id = ?",
+             WHERE company_id = 'company-01' AND id = ?
+               AND (assigned_employee_id IS NULL OR NOT EXISTS (
+                 SELECT 1 FROM employees e
+                 WHERE e.company_id = 'company-01' AND e.id = workstations.assigned_employee_id
+                   AND e.employment_status = 'ACTIVE'
+               ))",
         )
-        .bind(&assigned_employee_id)
+        .bind(&effective_assignment)
         .bind(workstation_status)
         .bind(&now)
         .bind(&desk.id)
@@ -330,7 +380,7 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                      device = CASE WHEN device = '' THEN 'NONE' ELSE device END,
                      posture = CASE WHEN posture = '' THEN 'SITTING' ELSE posture END,
                      presence = CASE WHEN presence = '' THEN 'AVAILABLE' ELSE presence END
-                 WHERE company_id = 'company-01' AND id = ?",
+                 WHERE company_id = 'company-01' AND id = ? AND employment_status = 'ACTIVE'",
             )
             .bind(&location.id)
             .bind(f64::from(location.x))
@@ -344,7 +394,8 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
     sqlx::query(
         "UPDATE employees SET model_profile_id = 'mock-profile-01'
-         WHERE company_id = 'company-01' AND model_profile_id IS NULL",
+         WHERE company_id = 'company-01' AND model_profile_id IS NULL
+           AND employment_status = 'ACTIVE'",
     )
     .execute(pool)
     .await?;
@@ -368,7 +419,7 @@ pub async fn seed_defaults(pool: &SqlitePool) -> Result<(), sqlx::Error> {
           acceptance_criteria, created_at, updated_at, goal_id)
          VALUES ('task-runtime-message-loop', ?, '处理 Agent 消息并保存回复',
                  '由 Agent Worker 读取消息、调用绑定模型、保存回复和记忆。',
-                 'backend', 'READY', 'backend-01', '[]',
+                 'admin', 'READY', 'hr-01', '[]',
                  '[\"消息可恢复\", \"回复写入数据库\", \"状态通过事件广播\"]', ?, ?,
                  'goal-office-runtime')",
     )
@@ -539,7 +590,7 @@ pub async fn employees(pool: &SqlitePool, company_id: &str) -> Result<Vec<Employ
         "SELECT employees.id, employees.company_id, employees.name, employees.age, employees.gender,
                 employees.role, employees.department, employees.title, employees.status,
                 employees.employment_status, employees.is_floor_administrator,
-                personality, skills, appearance, model_config, model_profile_id, desk_id, floor_id,
+                personality, skills, work_style, appearance, model_config, model_profile_id, desk_id, floor_id,
                 hired_at, current_state, current_destination,
                 activity, movement, location_id, position_x, position_y, room_id,
                 device, posture, presence, active_movement_id,
@@ -616,6 +667,37 @@ pub async fn ensure_employee_runtime_binding(
     .bind(&workspace_path)
     .bind(&now)
     .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Keep the bootstrap runtime task attached to the current company
+/// administrator. This repairs databases upgraded from the old seven-employee
+/// seed where the task pointed at `backend-01` or a terminated `hr-01`.
+pub async fn repair_default_runtime_task_assignee(
+    pool: &SqlitePool,
+    company_id: &str,
+) -> Result<(), sqlx::Error> {
+    let administrator_id: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM employees
+         WHERE company_id = ? AND is_floor_administrator = 1
+           AND employment_status = 'ACTIVE'
+         ORDER BY hired_at, id LIMIT 1",
+    )
+    .bind(company_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(administrator_id) = administrator_id else {
+        return Ok(());
+    };
+    sqlx::query(
+        "UPDATE tasks SET assignee_id = ?, updated_at = ?
+         WHERE company_id = ? AND id = 'task-runtime-message-loop'",
+    )
+    .bind(administrator_id)
+    .bind(Utc::now().to_rfc3339())
+    .bind(company_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -749,10 +831,38 @@ pub async fn record_runtime_event(
     event_type: &str,
     payload: &str,
 ) -> Result<(), sqlx::Error> {
+    record_runtime_event_with_key(
+        pool,
+        company_id,
+        employee_id,
+        runtime_agent_id,
+        run_id,
+        event_type,
+        payload,
+        0,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn record_runtime_event_with_key(
+    pool: &SqlitePool,
+    company_id: &str,
+    employee_id: Option<&str>,
+    runtime_agent_id: Option<&str>,
+    run_id: Option<&str>,
+    event_type: &str,
+    payload: &str,
+    sequence: i64,
+    event_key: Option<&str>,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO runtime_events
-         (id, company_id, employee_id, runtime_agent_id, run_id, event_type, payload, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, company_id, employee_id, runtime_agent_id, run_id, event_type, payload,
+          sequence, event_key, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT DO NOTHING",
     )
     .bind(format!("runtime-event-{}", Uuid::new_v4()))
     .bind(company_id)
@@ -761,6 +871,8 @@ pub async fn record_runtime_event(
     .bind(run_id)
     .bind(event_type)
     .bind(payload)
+    .bind(sequence)
+    .bind(event_key.unwrap_or_default())
     .bind(Utc::now().to_rfc3339())
     .execute(pool)
     .await?;
@@ -1808,7 +1920,11 @@ pub async fn create_meeting_message_jobs(
 pub async fn recover_running_jobs(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE agent_jobs SET status = 'PENDING', updated_at = ?
-         WHERE status IN ('RUNNING', 'WAITING')",
+         WHERE status = 'RUNNING'
+            OR (status = 'WAITING' AND NOT EXISTS (
+              SELECT 1 FROM runtime_tool_approvals a
+              WHERE a.agent_job_id = agent_jobs.id AND a.status = 'PENDING'
+            ))",
     )
     .bind(Utc::now().to_rfc3339())
     .execute(pool)
@@ -2023,6 +2139,7 @@ fn employee_from_row(
         is_floor_administrator: row.is_floor_administrator != 0,
         personality: serde_json::from_str(&row.personality).unwrap_or_default(),
         skills: serde_json::from_str(&row.skills).unwrap_or_default(),
+        work_style: row.work_style,
         appearance: serde_json::from_str(&row.appearance).unwrap_or_default(),
         model_config: serde_json::from_str(&row.model_config).unwrap_or_default(),
         model_profile: row
@@ -2099,6 +2216,7 @@ struct EmployeeSeed {
     status: String,
     personality: PersonalityProfile,
     skills: Vec<SkillProfile>,
+    work_style: String,
     appearance: crate::models::AppearanceProfile,
     model_config: AgentModelConfig,
     desk_id: Option<String>,
@@ -2109,106 +2227,20 @@ struct EmployeeSeed {
 
 fn default_employees() -> Vec<EmployeeSeed> {
     let now = Utc::now().to_rfc3339();
-    vec![
-        seed(
-            "supervisor-01",
-            "林屿",
-            36,
-            "male",
-            "主管 / Supervisor",
-            "管理层",
-            "Supervisor",
-            "冷静、克制、结果导向",
-            &["调度", "仲裁", "验收", "Review"],
-            1001,
-            "desk-supervisor-01",
-            &now,
-        ),
-        seed(
-            "hr-01",
-            "苏晴",
-            31,
-            "female",
-            "楼层管理员",
-            "管理员办公室",
-            "管理员",
-            "外向、细致、善于观察",
-            &["招聘与解雇", "楼层巡查", "Token预算", "任务干预"],
-            1002,
-            "desk-hr-01",
-            &now,
-        ),
-        seed(
-            "product-01",
-            "周启",
-            33,
-            "male",
-            "产品经理",
-            "Product",
-            "Product Manager",
-            "好奇、结构化、表达直接",
-            &["PRD", "需求拆解", "验收标准"],
-            1003,
-            "desk-product-01",
-            &now,
-        ),
-        seed(
-            "ui-01",
-            "沈知夏",
-            28,
-            "female",
-            "UI/UX 设计师",
-            "Design",
-            "UI/UX Designer",
-            "开放、审美敏锐、温和",
-            &["页面结构", "交互", "视觉规范"],
-            1004,
-            "desk-ui-01",
-            &now,
-        ),
-        seed(
-            "frontend-01",
-            "陈默",
-            30,
-            "male",
-            "前端工程师",
-            "Engineering",
-            "Frontend Engineer",
-            "专注、务实、低社交",
-            &["Web", "React", "UI 代码实现"],
-            1005,
-            "desk-frontend-01",
-            &now,
-        ),
-        seed(
-            "backend-01",
-            "顾言",
-            34,
-            "male",
-            "后端工程师",
-            "Engineering",
-            "Backend Engineer",
-            "严谨、谨慎、系统思维",
-            &["API", "Rust", "数据库", "服务端代码"],
-            1006,
-            "desk-backend-01",
-            &now,
-        ),
-        seed(
-            "qa-01",
-            "唐宁",
-            27,
-            "female",
-            "测试工程师",
-            "Quality",
-            "QA Engineer",
-            "怀疑精神强、耐心",
-            &["测试", "回归", "缺陷验证"],
-            1007,
-            "desk-qa-01",
-            &now,
-        ),
-    ]
+    vec![seed(
+        "hr-01",
+        "苏晴",
+        31,
+        "female",
+        "楼层管理员",
+        "管理员办公室",
+        "管理员",
+        "外向、细致、善于观察",
+        &["招聘与解雇", "楼层巡查", "Token预算", "任务干预"],
+        1002,
+        "desk-hr-01",
+        &now,
+    )]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2226,6 +2258,72 @@ fn seed(
     desk_id: &str,
     hired_at: &str,
 ) -> EmployeeSeed {
+    let (communication_style, decision_style, speech_habits): (&str, &str, &[&str]) = match id {
+        "supervisor-01" => (
+            "句子短，先说结论，再点出负责人、截止时间和验收结果",
+            "优先依据目标、风险和可验证结果做取舍",
+            &[
+                "常用“结论是”开场",
+                "不说空泛鼓励",
+                "收尾会明确下一步和责任人",
+            ],
+        ),
+        "hr-01" => (
+            "语气亲切但信息密度高，会复述对方重点并留意协作感受",
+            "先核对事实与人员约束，再平衡团队需要和个体工作方式",
+            &[
+                "会先称呼对方",
+                "常用“我确认一下”",
+                "敏感反馈用具体观察代替标签",
+            ],
+        ),
+        "product-01" => (
+            "直接使用目标、用户场景和优先级组织表达，喜欢用编号拆问题",
+            "从用户价值与范围成本出发，冲突时要求明确优先级",
+            &["常问“用户是谁”", "习惯列一二三", "结尾补一句验收口径"],
+        ),
+        "ui-01" => (
+            "温和、具体，善用场景化描述解释视觉与交互判断",
+            "兼顾一致性、可用性和情绪体验，愿意提出多个可比较方案",
+            &[
+                "常说“我会更倾向于”",
+                "用用户看到或感受到什么来描述",
+                "批评方案时同时给替代方向",
+            ],
+        ),
+        "frontend-01" => (
+            "惜字如金，偏工程口语，用组件、状态和边界条件说话",
+            "优先选择可维护且能尽快验证的实现，避免无必要抽象",
+            &[
+                "少寒暄",
+                "常用“可以，前提是…”",
+                "会主动指出浏览器或状态同步边界",
+            ],
+        ),
+        "backend-01" => (
+            "严谨克制，先定义数据与不变量，再讨论接口和异常路径",
+            "证据不足时保留判断，优先保证一致性、可恢复性与可观测性",
+            &[
+                "常用“这里有一个前提”",
+                "会区分正常路径和失败路径",
+                "避免绝对化承诺",
+            ],
+        ),
+        "qa-01" => (
+            "耐心但带质疑感，喜欢用反例、复现步骤和预期结果发言",
+            "先寻找最容易被忽略的失败条件，再根据风险安排验证顺序",
+            &[
+                "常问“如果……呢？”",
+                "会给最小复现条件",
+                "结论会标明已验证与未覆盖范围",
+            ],
+        ),
+        _ => (
+            "先确认目标和边界，再给出可执行方案",
+            "结合事实、经验与结果反馈推进",
+            &["表达保持简洁", "结尾明确下一步"],
+        ),
+    };
     let openness = 62 + (appearance_seed as u8 % 25);
     let conscientiousness = 70 + (appearance_seed as u8 % 20);
     let skills = skill_names
@@ -2253,10 +2351,19 @@ fn seed(
             agreeableness: 58 + (appearance_seed as u8 % 30),
             emotional_stability: 68 + (appearance_seed as u8 % 25),
             traits: traits.split('、').map(str::to_string).collect(),
-            communication_style: "先确认约束，再给出可执行结论".to_string(),
-            decision_style: "依据证据和验收条件推进".to_string(),
+            communication_style: communication_style.to_string(),
+            decision_style: decision_style.to_string(),
+            speech_habits: speech_habits
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            behavior_habits: vec![
+                "先核对事实与人员约束，再安排下一步".to_string(),
+                "定期检查招聘与运行状态".to_string(),
+            ],
         },
         skills,
+        work_style: "先核对人员与预算约束，再安排招聘、巡查和后续动作".to_string(),
         appearance: create_appearance(appearance_seed, gender, age),
         model_config: AgentModelConfig {
             provider: "mock".to_string(),
@@ -2267,5 +2374,351 @@ fn seed(
         hired_at: hired_at.to_string(),
         current_state: "IDLE".to_string(),
         is_floor_administrator: id == "hr-01",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use sha2::{Digest, Sha384};
+    use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+
+    use super::{repair_default_runtime_task_assignee, seed_defaults};
+
+    async fn test_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database should connect");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations should apply");
+        seed_defaults(&pool)
+            .await
+            .expect("bootstrap data should be seeded");
+        pool
+    }
+
+    fn migrations_through(version: i64) -> sqlx::migrate::Migrator {
+        let current = sqlx::migrate!("./migrations");
+        sqlx::migrate::Migrator {
+            migrations: Cow::Owned(
+                current
+                    .iter()
+                    .filter(|migration| migration.version <= version)
+                    .cloned()
+                    .collect(),
+            ),
+            ..sqlx::migrate::Migrator::DEFAULT
+        }
+    }
+
+    #[test]
+    fn employee_voice_migration_checksum_is_immutable() {
+        let checksum = Sha384::digest(include_bytes!(
+            "../migrations/0017_employee_voice_profiles.sql"
+        ));
+        let checksum_hex = checksum
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            checksum_hex,
+            "21f1053994885774e77c14a209686de3615eae61559e20e02060d2867b19ebb4251588baa5913db582096e752e393c87"
+        );
+    }
+
+    #[tokio::test]
+    async fn applying_work_style_after_voice_migration_preserves_existing_personality() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database should connect");
+
+        migrations_through(17)
+            .run(&pool)
+            .await
+            .expect("fixture migrations through version 17 should apply");
+
+        let applied_voice_checksum: Vec<u8> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 17")
+                .fetch_one(&pool)
+                .await
+                .expect("version 17 should be recorded");
+        let expected_voice_checksum = Sha384::digest(include_bytes!(
+            "../migrations/0017_employee_voice_profiles.sql"
+        ));
+        assert_eq!(applied_voice_checksum, expected_voice_checksum.as_slice());
+
+        sqlx::query(
+            "INSERT INTO companies (id, name, status, created_at)
+             VALUES ('fixture-company', 'Migration Fixture', 'active', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("fixture company should be inserted");
+        sqlx::query(
+            "INSERT INTO employees
+             (id, company_id, name, age, gender, role, department, title, status,
+              personality, skills, appearance, model_config, hired_at, current_state)
+             VALUES ('fixture-employee', 'fixture-company', 'Fixture Employee', 30,
+                     'unspecified', 'engineer', 'engineering', 'Engineer', 'online',
+                     '{\"communicationStyle\":\"custom fixture voice\",\"decisionStyle\":\"fixture decision\"}',
+                     '[]', '{}', '{}', '2026-01-01T00:00:00Z', 'IDLE')",
+        )
+        .execute(&pool)
+        .await
+        .expect("fixture employee should be inserted");
+
+        let before_personality: String =
+            sqlx::query_scalar("SELECT personality FROM employees WHERE id = 'fixture-employee'")
+                .fetch_one(&pool)
+                .await
+                .expect("fixture personality should be queryable");
+        assert_eq!(
+            before_personality,
+            "{\"communicationStyle\":\"custom fixture voice\",\"decisionStyle\":\"fixture decision\"}"
+        );
+        let work_style_columns_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('employees') WHERE name = 'work_style'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("work_style column check should succeed");
+        assert_eq!(work_style_columns_before, 0);
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("current migrations should apply version 18");
+
+        let applied_versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&pool)
+                .await
+                .expect("applied migration versions should be queryable");
+        assert_eq!(applied_versions, (1..=18).collect::<Vec<_>>());
+        let after_personality: String =
+            sqlx::query_scalar("SELECT personality FROM employees WHERE id = 'fixture-employee'")
+                .fetch_one(&pool)
+                .await
+                .expect("fixture personality should remain queryable");
+        assert_eq!(after_personality, before_personality);
+        let work_style: String =
+            sqlx::query_scalar("SELECT work_style FROM employees WHERE id = 'fixture-employee'")
+                .fetch_one(&pool)
+                .await
+                .expect("work_style should be available after version 18");
+        assert_eq!(work_style, "");
+    }
+
+    #[tokio::test]
+    async fn repairs_bootstrap_task_after_historical_administrator_termination() {
+        let pool = test_pool().await;
+
+        sqlx::query(
+            "UPDATE employees
+             SET employment_status = 'TERMINATED', is_floor_administrator = 0
+             WHERE company_id = 'company-01' AND id = 'hr-01'",
+        )
+        .execute(&pool)
+        .await
+        .expect("historical administrator should be terminable");
+
+        crate::organization::ensure_company_administrator(&pool)
+            .await
+            .expect("a replacement administrator should be created");
+        repair_default_runtime_task_assignee(&pool, "company-01")
+            .await
+            .expect("bootstrap task should be repaired");
+
+        let active_administrator: String = sqlx::query_scalar(
+            "SELECT id FROM employees
+             WHERE company_id = 'company-01'
+               AND is_floor_administrator = 1
+               AND employment_status = 'ACTIVE'
+             ORDER BY hired_at, id LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("replacement administrator should be active");
+        let assigned_employee: String = sqlx::query_scalar(
+            "SELECT assignee_id FROM tasks
+             WHERE company_id = 'company-01' AND id = 'task-runtime-message-loop'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("bootstrap task should exist");
+        let historical_status: String = sqlx::query_scalar(
+            "SELECT employment_status FROM employees
+             WHERE company_id = 'company-01' AND id = 'hr-01'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("historical employee should remain");
+
+        assert_eq!(assigned_employee, active_administrator);
+        assert_ne!(assigned_employee, "hr-01");
+        assert_eq!(historical_status, "TERMINATED");
+    }
+
+    #[tokio::test]
+    async fn records_http_hiring_usage_without_an_agent_job() {
+        let pool = test_pool().await;
+        let usage = crate::models::TokenUsageSummary {
+            input_tokens: 17,
+            output_tokens: 9,
+            cache_tokens: 3,
+            total_tokens: 26,
+        };
+        let call_id = super::record_llm_call(
+            &pool,
+            super::LlmCallInput {
+                company_id: "company-01",
+                employee_id: "hr-01",
+                job_id: None,
+                model_profile_id: "mock-profile-01",
+                model: "test-model",
+                status: "COMPLETED",
+                usage: &usage,
+                latency_ms: 12,
+                error: None,
+            },
+        )
+        .await
+        .expect("HTTP hiring usage should be persisted");
+        let row = sqlx::query(
+            "SELECT employee_id, job_id, model_profile_id, input_tokens, total_tokens
+             FROM llm_calls WHERE id = ?",
+        )
+        .bind(&call_id)
+        .fetch_one(&pool)
+        .await
+        .expect("persisted usage row should be queryable");
+        assert_eq!(row.try_get::<String, _>("employee_id").unwrap(), "hr-01");
+        assert_eq!(row.try_get::<Option<String>, _>("job_id").unwrap(), None);
+        assert_eq!(
+            row.try_get::<String, _>("model_profile_id").unwrap(),
+            "mock-profile-01"
+        );
+        assert_eq!(row.try_get::<i64, _>("input_tokens").unwrap(), 17);
+        assert_eq!(row.try_get::<i64, _>("total_tokens").unwrap(), 26);
+    }
+
+    #[tokio::test]
+    async fn hiring_personalization_falls_back_and_audits_failed_model_call() {
+        let pool = test_pool().await;
+        let created = crate::organization::create_hiring_from_message(
+            &pool,
+            "company-01",
+            "hr-01",
+            None,
+            "招聘一个懂 Rust 的后端工程师",
+        )
+        .await
+        .expect("hiring request should be created");
+        sqlx::query(
+            "UPDATE model_profiles
+             SET protocol = 'unsupported', model = 'test-invalid-provider'
+             WHERE id = 'mock-profile-01'",
+        )
+        .execute(&pool)
+        .await
+        .expect("test model profile should be changed");
+
+        let result = crate::organization::personalize_hiring_candidates(
+            &pool,
+            "company-01",
+            &created.request.id,
+            Some("hr-01"),
+            None,
+        )
+        .await
+        .expect("failed model personalization should use fallback");
+        assert_eq!(result.generation_mode, "mock_fallback");
+        assert_eq!(
+            result.fallback_reason.as_deref(),
+            Some("administrator_model_request_failed")
+        );
+        assert_eq!(
+            result
+                .request
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.status == "AVAILABLE")
+                .count(),
+            created
+                .request
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.status == "AVAILABLE")
+                .count()
+        );
+        let row = sqlx::query(
+            "SELECT employee_id, job_id, model_profile_id, status
+             FROM llm_calls ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("failed model call should be audited");
+        assert_eq!(row.try_get::<String, _>("employee_id").unwrap(), "hr-01");
+        assert_eq!(row.try_get::<Option<String>, _>("job_id").unwrap(), None);
+        assert_eq!(
+            row.try_get::<String, _>("model_profile_id").unwrap(),
+            "mock-profile-01"
+        );
+        assert_eq!(row.try_get::<String, _>("status").unwrap(), "FAILED");
+    }
+
+    #[tokio::test]
+    async fn hired_employee_keeps_candidate_work_style() {
+        let pool = test_pool().await;
+        let request = crate::organization::create_hiring_from_message(
+            &pool,
+            "company-01",
+            "hr-01",
+            None,
+            "招聘一个懂 Rust 的后端工程师",
+        )
+        .await
+        .expect("hiring request should be created");
+        let candidate = request
+            .request
+            .candidates
+            .first()
+            .expect("a mock candidate should be available")
+            .clone();
+        let workstation = crate::organization::create_workstation(
+            &pool,
+            "company-01",
+            &request.floor_id,
+            Some(330.0),
+            Some(180.0),
+            None,
+            None,
+        )
+        .await
+        .expect("a workstation should be created");
+        let draft = crate::organization::hire_candidate(
+            &pool,
+            "company-01",
+            &request.request.id,
+            &candidate.id,
+            Some(&workstation.id),
+        )
+        .await
+        .expect("candidate should be hired");
+        let employee_work_style: String =
+            sqlx::query_scalar("SELECT work_style FROM employees WHERE company_id = ? AND id = ?")
+                .bind("company-01")
+                .bind(&draft.employee_id)
+                .fetch_one(&pool)
+                .await
+                .expect("hired employee should be persisted");
+        assert_eq!(employee_work_style, candidate.work_style);
     }
 }

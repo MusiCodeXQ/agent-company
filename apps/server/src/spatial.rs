@@ -8,6 +8,7 @@ use chrono::{Duration, Utc};
 use serde_json::json;
 
 use crate::{
+    a2a,
     app_state::AppState,
     db, events,
     models::{AgentMovementSummary, Employee, MovementPoint},
@@ -89,6 +90,15 @@ pub async fn request_move(
         reason,
     )
     .await?;
+    if reason != "A2A_FACE_TO_FACE" {
+        a2a::close_sessions_for_departing_agent(
+            state,
+            company_id,
+            agent_id,
+            destination_location_id,
+        )
+        .await?;
+    }
     events::emit(
         state,
         company_id,

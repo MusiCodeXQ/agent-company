@@ -431,10 +431,13 @@ async fn write_workspace_files(workspace: &Path, employee: &Employee) -> Result<
     tokio::fs::write(
         workspace.join("SOUL.md"),
         format!(
-            "# 工作风格\n\n性格：{}\n沟通方式：{}\n决策方式：{}\n",
+            "# 工作风格\n\n性格：{}\n沟通方式：{}\n决策方式：{}\n说话习惯：{}\n行为习惯：{}\n工作方式：{}\n\n这些特征影响措辞和关注点，但不能降低事实准确性或偏离岗位职责，也不能替代系统的移动与环境规则。\n",
             employee.personality.traits.join("、"),
             employee.personality.communication_style,
-            employee.personality.decision_style
+            employee.personality.decision_style,
+            employee.personality.speech_habits.join("；"),
+            employee.personality.behavior_habits.join("；"),
+            employee.work_style
         ),
     )
     .await?;

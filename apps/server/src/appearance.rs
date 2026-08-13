@@ -29,10 +29,17 @@ impl SeededRng {
 
 pub fn create_appearance(seed: u64, gender: &str, age: u8) -> AppearanceProfile {
     let mut rng = SeededRng::new(seed);
-    let hair_styles = if age >= 32 {
-        &["short", "side_part", "bob", "wave"][..]
-    } else {
-        &["short", "side_part", "bob", "wave", "curly"][..]
+    let hair_styles = match gender {
+        "female" if age >= 32 => &["bob", "wave", "side_part", "bob"][..],
+        "female" => &["bob", "wave", "curly", "side_part", "wave"][..],
+        "male" if age >= 32 => &["short", "side_part", "short", "side_part"][..],
+        "male" => &["short", "side_part", "curly", "short"][..],
+        _ => &["short", "side_part", "bob", "wave", "curly"][..],
+    };
+    let bottom_styles = match gender {
+        "female" => &["trousers", "jeans", "skirt", "trousers"][..],
+        "male" => &["trousers", "jeans", "trousers", "jeans"][..],
+        _ => &["trousers", "jeans", "skirt"][..],
     };
     let beard_style = if gender == "male" && age >= 30 && rng.boolean(36) {
         Some(rng.pick(&["short", "neat", "stubble"]).to_string())
@@ -57,7 +64,7 @@ pub fn create_appearance(seed: u64, gender: &str, age: u8) -> AppearanceProfile 
                 "#3E5C76", "#6B4E71", "#2E7866", "#C2704B", "#556B8A", "#9A6B3F",
             ])
             .to_string(),
-        bottom_style: rng.pick(&["trousers", "jeans", "skirt"]).to_string(),
+        bottom_style: rng.pick(bottom_styles).to_string(),
         bottom_color: rng
             .pick(&["#26364A", "#39424E", "#5A4038", "#2C514B", "#6E5D45"])
             .to_string(),
@@ -86,5 +93,15 @@ mod tests {
         assert_eq!(first.hair_color, second.hair_color);
         assert_eq!(first.top_color, second.top_color);
         assert_eq!(first.height_scale, second.height_scale);
+    }
+
+    #[test]
+    fn gender_identity_affects_generated_character_details() {
+        let male = create_appearance(42, "male", 34);
+        let female = create_appearance(42, "female", 34);
+
+        assert_ne!(male.hair_style, female.hair_style);
+        assert_ne!(male.bottom_style, "skirt");
+        assert!(female.beard_style.is_none());
     }
 }
