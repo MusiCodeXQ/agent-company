@@ -39,7 +39,7 @@
 
 - `apps/web/src/App.tsx` 中的 `PhoneModal`。
 - `apps/web/src/App.tsx` 中的 `MeetingModal`。
-- `apps/server/src/db.rs` 中的员工消息历史查询。
+- `apps/server/src/infrastructure/db.rs` 中的员工消息历史查询。
 
 ### 2.2 当前看不到的内容
 
@@ -136,7 +136,7 @@ ADK `Runner` 会产生事件，但 `apps/employee-runtime/src/main.rs` 当前在
 2. 使用 NDJSON：每行一个带 `schemaVersion` 的运行事件。
 3. 至少支持 `run.started`、`model.started`、`tool.requested`、`tool.started`、`tool.completed`、`approval.required`、`usage.updated`、`artifact.created`、`run.completed`、`run.failed`。
 4. 每个事件携带 `companyId`、`employeeId`、`agentJobId`、`runtimeRunId`、`runtimeSessionId`、`sequence` 和时间戳。
-5. `apps/server/src/adk_runtime.rs` 逐行解析并立即写入 `runtime_events`，再转换成公司领域事件推送 WebSocket。
+5. `apps/server/src/agent_runtime/adk.rs` 逐行解析并立即写入 `runtime_events`，再转换成公司领域事件推送 WebSocket。
 6. 用单调递增的 `sequence` 和唯一 `eventId` 去重，容器退出后允许安全重放尾部事件。
 7. 最终结果仍保留 `run.completed`，避免把流式展示和权威完成状态混为一谈。
 8. 解析到未知事件类型时持久化原始 JSON 并忽略展示，保证前后版本兼容。
@@ -563,10 +563,10 @@ GET /api/companies/:companyId/runtime/runs/:runId/tool-calls
 2. `apps/employee-runtime/src/protocol.rs`：新增 NDJSON 事件 envelope 和版本兼容解析测试。
 3. `apps/employee-runtime/src/plugins.rs`：治理、预算、审计、脱敏和 telemetry 插件。
 4. `apps/employee-runtime/src/workflows/`：Graph 工作流和 checkpoint 适配器。
-5. `apps/server/src/adk_runtime.rs`：流式读取、幂等事件写入、审批恢复和 trace 传播。
-6. `apps/server/src/runtime_store.rs`：运行、工具调用、检查点和事件的原子持久化。
-7. `apps/server/src/a2a.rs`：A2A 标准模型适配、到场策略和幂等检查。
-8. `apps/server/src/routes/communications.rs`：A2A 会话、消息、任务和审计只读 API。
+5. `apps/server/src/agent_runtime/adk.rs`：流式读取、幂等事件写入、审批恢复和 trace 传播。
+6. `apps/server/src/infrastructure/runtime_store.rs`：运行、工具调用、检查点和事件的原子持久化。
+7. `apps/server/src/application/a2a.rs`：A2A 标准模型适配、到场策略和幂等检查。
+8. `apps/server/src/api/mod.rs`：A2A 会话、消息、任务和审计只读 API。
 9. `apps/web/src/features/communications/`：会话列表、时间线、筛选、详情和制品查看器。
 10. `apps/web/src/store/company-store.ts`：消费新的领域事件，只更新事件级状态，不参与逐帧动画。
 

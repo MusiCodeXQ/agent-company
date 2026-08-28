@@ -7,15 +7,22 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::{
+    agent_runtime::worker as runtime,
     app_state::AppState,
-    db::{self, AgentJob},
-    events,
-    models::{
-        A2aCommunicationAudit, A2aCommunicationDetail, A2aCommunicationMessage,
-        A2aCommunicationTask, A2aFaceToFaceSession, A2aFaceToFaceSessionCreated,
-        A2aFaceToFaceSessionInput, A2aSendMessageInput,
+    application::organization,
+    domain::{
+        models::{
+            A2aCommunicationAudit, A2aCommunicationDetail, A2aCommunicationMessage,
+            A2aCommunicationTask, A2aFaceToFaceSession, A2aFaceToFaceSessionCreated,
+            A2aFaceToFaceSessionInput, A2aSendMessageInput,
+        },
+        office,
     },
-    office, organization, runtime, spatial,
+    infrastructure::{
+        db::{self, AgentJob},
+        events,
+    },
+    office::navigation as spatial,
 };
 
 pub const PROTOCOL_VERSION: &str = "1.0";

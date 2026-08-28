@@ -1,3 +1,5 @@
+pub(crate) mod websocket;
+
 use axum::{
     extract::{ws::WebSocketUpgrade, Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -9,16 +11,21 @@ use chrono::Utc;
 use serde_json::json;
 
 use crate::{
-    a2a,
+    agent_runtime::{container_runtime, llm, openclaw},
     app_state::AppState,
-    container_runtime, db, events, llm, model_profiles,
-    models::{
-        A2aFaceToFaceSessionInput, A2aSendMessageInput, CompanySnapshot, EmployeeModelProfileInput,
-        EventsQuery, FloorInput, FloorUpdateInput, HireCandidateInput, MeetingInput,
-        MessageHistoryQuery, MessageInput, ModelProfileInput, ModelProfileUpdate, MoveAgentInput,
-        RuntimeProvisionInput, TerminationInput, WebSocketQuery, WorkstationInput,
+    application::{a2a, offboarding, organization},
+    domain::{
+        models::{
+            A2aFaceToFaceSessionInput, A2aSendMessageInput, CompanySnapshot,
+            EmployeeModelProfileInput, EventsQuery, FloorInput, FloorUpdateInput,
+            HireCandidateInput, MeetingInput, MessageHistoryQuery, MessageInput, ModelProfileInput,
+            ModelProfileUpdate, MoveAgentInput, RuntimeProvisionInput, TerminationInput,
+            WebSocketQuery, WorkstationInput,
+        },
+        office,
     },
-    offboarding, office, openclaw, organization, runtime_store, spatial, system_logs, websocket,
+    infrastructure::{db, events, model_profiles, runtime_store, system_logs},
+    office::navigation as spatial,
 };
 
 const COMPANY_ID: &str = "company-01";
@@ -218,7 +225,7 @@ async fn snapshot(
         .collect::<Vec<_>>();
     let office_state = employees
         .iter()
-        .map(|employee| crate::models::OfficeActorState {
+        .map(|employee| crate::domain::models::OfficeActorState {
             employee_id: employee.id.clone(),
             current_state: employee.current_state.clone(),
             destination: employee.current_destination.clone(),
@@ -267,7 +274,7 @@ async fn snapshot(
 async fn event_list(
     State(state): State<AppState>,
     Query(query): Query<EventsQuery>,
-) -> Result<Json<Vec<crate::models::DomainEvent>>, ApiError> {
+) -> Result<Json<Vec<crate::domain::models::DomainEvent>>, ApiError> {
     Ok(Json(
         events::after(&state.pool, COMPANY_ID, query.after.as_deref()).await?,
     ))
@@ -275,7 +282,7 @@ async fn event_list(
 
 async fn list_model_profiles(
     State(state): State<AppState>,
-) -> Result<Json<Vec<crate::models::ModelProfileSummary>>, ApiError> {
+) -> Result<Json<Vec<crate::domain::models::ModelProfileSummary>>, ApiError> {
     Ok(Json(
         model_profiles::list(&state.pool, COMPANY_ID)
             .await
@@ -286,7 +293,7 @@ async fn list_model_profiles(
 async fn create_model_profile(
     State(state): State<AppState>,
     Json(input): Json<ModelProfileInput>,
-) -> Result<(StatusCode, Json<crate::models::ModelProfileSummary>), ApiError> {
+) -> Result<(StatusCode, Json<crate::domain::models::ModelProfileSummary>), ApiError> {
     let profile = model_profiles::create(&state.pool, COMPANY_ID, input)
         .await
         .map_err(ApiError::from_anyhow)?;
@@ -297,7 +304,7 @@ async fn update_model_profile(
     State(state): State<AppState>,
     Path(profile_id): Path<String>,
     Json(input): Json<ModelProfileUpdate>,
-) -> Result<Json<crate::models::ModelProfileSummary>, ApiError> {
+) -> Result<Json<crate::domain::models::ModelProfileSummary>, ApiError> {
     Ok(Json(
         model_profiles::update(&state.pool, &profile_id, input)
             .await
@@ -318,13 +325,13 @@ async fn test_model_profile(
     }
 }
 
-async fn openclaw_status() -> Result<Json<crate::models::OpenClawStatus>, ApiError> {
+async fn openclaw_status() -> Result<Json<crate::domain::models::OpenClawStatus>, ApiError> {
     Ok(Json(openclaw::health().await))
 }
 
 async fn container_runtime_status(
     State(state): State<AppState>,
-) -> Json<crate::models::ContainerRuntimeStatus> {
+) -> Json<crate::domain::models::ContainerRuntimeStatus> {
     Json(system_logs::sanitize_container_status(
         state.container_engine.status().await,
     ))
@@ -333,7 +340,7 @@ async fn container_runtime_status(
 async fn termination_preview(
     State(state): State<AppState>,
     Path((company_id, employee_id)): Path<(String, String)>,
-) -> Result<Json<crate::models::TerminationPreview>, ApiError> {
+) -> Result<Json<crate::domain::models::TerminationPreview>, ApiError> {
     Ok(Json(
         offboarding::preview(&state.pool, &company_id, &employee_id)
             .await
@@ -344,7 +351,7 @@ async fn termination_preview(
 async fn employee_terminations(
     State(state): State<AppState>,
     Path((company_id, employee_id)): Path<(String, String)>,
-) -> Result<Json<Vec<crate::models::TerminationRecordSummary>>, ApiError> {
+) -> Result<Json<Vec<crate::domain::models::TerminationRecordSummary>>, ApiError> {
     Ok(Json(
         offboarding::records(&state.pool, &company_id, &employee_id)
             .await
@@ -356,7 +363,7 @@ async fn terminate_employee(
     State(state): State<AppState>,
     Path((company_id, employee_id)): Path<(String, String)>,
     Json(input): Json<TerminationInput>,
-) -> Result<Json<crate::models::TerminationRecordSummary>, ApiError> {
+) -> Result<Json<crate::domain::models::TerminationRecordSummary>, ApiError> {
     let record = offboarding::start(
         &state,
         &company_id,
@@ -376,7 +383,7 @@ async fn terminate_employee(
 async fn cancel_employee_termination(
     State(state): State<AppState>,
     Path((company_id, employee_id)): Path<(String, String)>,
-) -> Result<Json<crate::models::Employee>, ApiError> {
+) -> Result<Json<crate::domain::models::Employee>, ApiError> {
     let employee = offboarding::cancel(&state, &company_id, &employee_id)
         .await
         .map_err(ApiError::from_anyhow)?;
@@ -386,7 +393,7 @@ async fn cancel_employee_termination(
 async fn provision_employee_runtime(
     State(state): State<AppState>,
     Path((company_id, employee_id)): Path<(String, String)>,
-) -> Result<Json<crate::models::Employee>, ApiError> {
+) -> Result<Json<crate::domain::models::Employee>, ApiError> {
     let employee = db::employees(&state.pool, &company_id)
         .await?
         .into_iter()
@@ -444,7 +451,7 @@ async fn provision_employee_workspace(
     State(state): State<AppState>,
     Path((company_id, employee_id)): Path<(String, String)>,
     Json(input): Json<RuntimeProvisionInput>,
-) -> Result<Json<crate::models::RuntimeWorkspaceSummary>, ApiError> {
+) -> Result<Json<crate::domain::models::RuntimeWorkspaceSummary>, ApiError> {
     if input
         .runtime_type
         .as_deref()
@@ -528,7 +535,7 @@ async fn set_employee_model_profile(
     State(state): State<AppState>,
     Path((company_id, employee_id)): Path<(String, String)>,
     Json(input): Json<EmployeeModelProfileInput>,
-) -> Result<Json<crate::models::Employee>, ApiError> {
+) -> Result<Json<crate::domain::models::Employee>, ApiError> {
     db::set_employee_model_profile(
         &state.pool,
         &company_id,
@@ -620,7 +627,7 @@ async fn employee_messages(
     State(state): State<AppState>,
     Path((company_id, employee_id)): Path<(String, String)>,
     Query(query): Query<MessageHistoryQuery>,
-) -> Result<Json<Vec<crate::models::MessageRecord>>, ApiError> {
+) -> Result<Json<Vec<crate::domain::models::MessageRecord>>, ApiError> {
     Ok(Json(
         db::messages_for_employee_page(
             &state.pool,
@@ -653,7 +660,7 @@ async fn mark_employee_messages_read(
 async fn employee_memory(
     State(state): State<AppState>,
     Path((company_id, employee_id)): Path<(String, String)>,
-) -> Result<Json<Vec<crate::models::AgentMemoryRecord>>, ApiError> {
+) -> Result<Json<Vec<crate::domain::models::AgentMemoryRecord>>, ApiError> {
     Ok(Json(
         db::memory(&state.pool, &company_id, &employee_id).await?,
     ))
@@ -662,7 +669,7 @@ async fn employee_memory(
 async fn company_jobs(
     State(state): State<AppState>,
     Path(company_id): Path<String>,
-) -> Result<Json<Vec<crate::models::AgentJobSummary>>, ApiError> {
+) -> Result<Json<Vec<crate::domain::models::AgentJobSummary>>, ApiError> {
     Ok(Json(db::jobs(&state.pool, &company_id).await?))
 }
 
@@ -686,7 +693,7 @@ async fn company_system_logs(
 async fn list_runtime_tool_approvals(
     State(state): State<AppState>,
     Path(company_id): Path<String>,
-) -> Result<Json<Vec<crate::models::RuntimeToolApprovalSummary>>, ApiError> {
+) -> Result<Json<Vec<crate::domain::models::RuntimeToolApprovalSummary>>, ApiError> {
     Ok(Json(
         runtime_store::pending_tool_approvals(&state.pool, &company_id).await?,
     ))
@@ -695,8 +702,8 @@ async fn list_runtime_tool_approvals(
 async fn decide_runtime_tool_approval(
     State(state): State<AppState>,
     Path((company_id, approval_id)): Path<(String, String)>,
-    Json(input): Json<crate::models::RuntimeToolApprovalDecision>,
-) -> Result<Json<crate::models::RuntimeToolApprovalSummary>, ApiError> {
+    Json(input): Json<crate::domain::models::RuntimeToolApprovalDecision>,
+) -> Result<Json<crate::domain::models::RuntimeToolApprovalSummary>, ApiError> {
     let decision = match input.decision.to_ascii_uppercase().as_str() {
         "APPROVE" | "APPROVED" => "APPROVED",
         "DENY" | "DENIED" => "DENIED",
@@ -735,7 +742,7 @@ async fn decide_runtime_tool_approval(
 async fn list_floors(
     State(state): State<AppState>,
     Path(company_id): Path<String>,
-) -> Result<Json<Vec<crate::models::FloorSummary>>, ApiError> {
+) -> Result<Json<Vec<crate::domain::models::FloorSummary>>, ApiError> {
     Ok(Json(organization::floors(&state.pool, &company_id).await?))
 }
 
@@ -743,7 +750,7 @@ async fn create_floor(
     State(state): State<AppState>,
     Path(company_id): Path<String>,
     Json(input): Json<FloorInput>,
-) -> Result<(StatusCode, Json<crate::models::FloorSummary>), ApiError> {
+) -> Result<(StatusCode, Json<crate::domain::models::FloorSummary>), ApiError> {
     let floor = organization::create_floor(
         &state.pool,
         &company_id,
@@ -769,7 +776,7 @@ async fn update_floor(
     State(state): State<AppState>,
     Path((company_id, floor_id)): Path<(String, String)>,
     Json(input): Json<FloorUpdateInput>,
-) -> Result<Json<crate::models::FloorSummary>, ApiError> {
+) -> Result<Json<crate::domain::models::FloorSummary>, ApiError> {
     let floor = organization::update_floor(
         &state.pool,
         &company_id,
@@ -815,7 +822,7 @@ async fn delete_floor(
 async fn list_workstations(
     State(state): State<AppState>,
     Path((company_id, floor_id)): Path<(String, String)>,
-) -> Result<Json<Vec<crate::models::WorkstationSummary>>, ApiError> {
+) -> Result<Json<Vec<crate::domain::models::WorkstationSummary>>, ApiError> {
     Ok(Json(
         organization::workstations(&state.pool, &company_id, &floor_id).await?,
     ))
@@ -825,7 +832,7 @@ async fn create_workstation(
     State(state): State<AppState>,
     Path((company_id, floor_id)): Path<(String, String)>,
     Json(input): Json<WorkstationInput>,
-) -> Result<(StatusCode, Json<crate::models::WorkstationSummary>), ApiError> {
+) -> Result<(StatusCode, Json<crate::domain::models::WorkstationSummary>), ApiError> {
     let workstation = organization::create_workstation(
         &state.pool,
         &company_id,
@@ -852,7 +859,7 @@ async fn create_workstation(
 async fn list_hiring_requests(
     State(state): State<AppState>,
     Path(company_id): Path<String>,
-) -> Result<Json<Vec<crate::models::HiringRequestSummary>>, ApiError> {
+) -> Result<Json<Vec<crate::domain::models::HiringRequestSummary>>, ApiError> {
     Ok(Json(
         organization::hiring_requests(&state.pool, &company_id).await?,
     ))
@@ -933,7 +940,7 @@ async fn hire_candidate(
 async fn refresh_candidates(
     State(state): State<AppState>,
     Path((company_id, request_id)): Path<(String, String)>,
-) -> Result<Json<crate::models::HiringRequestSummary>, ApiError> {
+) -> Result<Json<crate::domain::models::HiringRequestSummary>, ApiError> {
     let template = organization::refresh_candidates(&state.pool, &company_id, &request_id)
         .await
         .map_err(ApiError::from_anyhow)?;
@@ -980,8 +987,8 @@ async fn create_meeting(
     State(state): State<AppState>,
     Path(company_id): Path<String>,
     Json(input): Json<MeetingInput>,
-) -> Result<(StatusCode, Json<crate::models::MeetingSummary>), ApiError> {
-    let meeting = crate::meetings::create(&state, &company_id, input)
+) -> Result<(StatusCode, Json<crate::domain::models::MeetingSummary>), ApiError> {
+    let meeting = crate::application::meetings::create(&state, &company_id, input)
         .await
         .map_err(ApiError::from_anyhow)?;
     Ok((StatusCode::CREATED, Json(meeting)))
@@ -990,9 +997,9 @@ async fn create_meeting(
 async fn finish_meeting(
     State(state): State<AppState>,
     Path((company_id, meeting_id)): Path<(String, String)>,
-) -> Result<Json<crate::models::MeetingSummary>, ApiError> {
+) -> Result<Json<crate::domain::models::MeetingSummary>, ApiError> {
     Ok(Json(
-        crate::meetings::finish(&state, &company_id, &meeting_id)
+        crate::application::meetings::finish(&state, &company_id, &meeting_id)
             .await
             .map_err(ApiError::from_anyhow)?,
     ))
@@ -1074,7 +1081,13 @@ async fn move_agent(
     State(state): State<AppState>,
     Path((company_id, agent_id)): Path<(String, String)>,
     Json(input): Json<MoveAgentInput>,
-) -> Result<(StatusCode, Json<crate::models::AgentMovementSummary>), ApiError> {
+) -> Result<
+    (
+        StatusCode,
+        Json<crate::domain::models::AgentMovementSummary>,
+    ),
+    ApiError,
+> {
     let movement = spatial::request_move(
         &state,
         &company_id,
@@ -1091,7 +1104,13 @@ async fn create_a2a_face_to_face_session(
     State(state): State<AppState>,
     Path(company_id): Path<String>,
     Json(input): Json<A2aFaceToFaceSessionInput>,
-) -> Result<(StatusCode, Json<crate::models::A2aFaceToFaceSessionCreated>), ApiError> {
+) -> Result<
+    (
+        StatusCode,
+        Json<crate::domain::models::A2aFaceToFaceSessionCreated>,
+    ),
+    ApiError,
+> {
     let created = a2a::create_face_to_face_session(&state, &company_id, input)
         .await
         .map_err(ApiError::from_anyhow)?;
@@ -1101,7 +1120,7 @@ async fn create_a2a_face_to_face_session(
 async fn get_a2a_face_to_face_session(
     State(state): State<AppState>,
     Path((company_id, session_id)): Path<(String, String)>,
-) -> Result<Json<crate::models::A2aFaceToFaceSession>, ApiError> {
+) -> Result<Json<crate::domain::models::A2aFaceToFaceSession>, ApiError> {
     Ok(Json(
         a2a::session(&state.pool, &company_id, &session_id)
             .await
@@ -1112,7 +1131,7 @@ async fn get_a2a_face_to_face_session(
 async fn close_a2a_face_to_face_session(
     State(state): State<AppState>,
     Path((company_id, session_id)): Path<(String, String)>,
-) -> Result<Json<crate::models::A2aFaceToFaceSession>, ApiError> {
+) -> Result<Json<crate::domain::models::A2aFaceToFaceSession>, ApiError> {
     Ok(Json(
         a2a::close_session(&state, &company_id, &session_id, "closed by API")
             .await
@@ -1123,8 +1142,8 @@ async fn close_a2a_face_to_face_session(
 async fn list_a2a_communications(
     State(state): State<AppState>,
     Path(company_id): Path<String>,
-    Query(query): Query<crate::models::A2aHistoryQuery>,
-) -> Result<Json<Vec<crate::models::A2aFaceToFaceSession>>, ApiError> {
+    Query(query): Query<crate::domain::models::A2aHistoryQuery>,
+) -> Result<Json<Vec<crate::domain::models::A2aFaceToFaceSession>>, ApiError> {
     Ok(Json(
         a2a::list_communications(
             &state.pool,
@@ -1140,7 +1159,7 @@ async fn list_a2a_communications(
 async fn get_a2a_communication(
     State(state): State<AppState>,
     Path((company_id, session_id)): Path<(String, String)>,
-) -> Result<Json<crate::models::A2aCommunicationDetail>, ApiError> {
+) -> Result<Json<crate::domain::models::A2aCommunicationDetail>, ApiError> {
     Ok(Json(
         a2a::communication_detail(&state.pool, &company_id, &session_id)
             .await

@@ -5,15 +5,15 @@ use sqlx::sqlite::{SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{sqlite::SqliteConnectOptions, FromRow, Row, SqlitePool};
 use uuid::Uuid;
 
-use crate::appearance::create_appearance;
-use crate::model_profiles;
-use crate::models::{
+use crate::domain::appearance::create_appearance;
+use crate::domain::models::{
     AgentJobSummary, AgentMemoryRecord, AgentModelConfig, AgentMovementSummary, Company, Employee,
     GoalSummary, MeetingParticipantSummary, MeetingSummary, MessageRecord, ModelProfileSummary,
     MovementPoint, PersonalityProfile, RuntimeBindingSummary, SkillProfile, TaskSummary,
     TokenUsageSummary,
 };
-use crate::office;
+use crate::domain::office;
+use crate::infrastructure::model_profiles;
 
 #[derive(Debug, FromRow)]
 struct EmployeeRow {
@@ -2217,7 +2217,7 @@ struct EmployeeSeed {
     personality: PersonalityProfile,
     skills: Vec<SkillProfile>,
     work_style: String,
-    appearance: crate::models::AppearanceProfile,
+    appearance: crate::domain::models::AppearanceProfile,
     model_config: AgentModelConfig,
     desk_id: Option<String>,
     hired_at: String,
@@ -2419,7 +2419,7 @@ mod tests {
     #[test]
     fn employee_voice_migration_checksum_is_immutable() {
         let checksum = Sha384::digest(include_bytes!(
-            "../migrations/0017_employee_voice_profiles.sql"
+            "../../migrations/0017_employee_voice_profiles.sql"
         ));
         let checksum_hex = checksum
             .iter()
@@ -2450,7 +2450,7 @@ mod tests {
                 .await
                 .expect("version 17 should be recorded");
         let expected_voice_checksum = Sha384::digest(include_bytes!(
-            "../migrations/0017_employee_voice_profiles.sql"
+            "../../migrations/0017_employee_voice_profiles.sql"
         ));
         assert_eq!(applied_voice_checksum, expected_voice_checksum.as_slice());
 
@@ -2529,7 +2529,7 @@ mod tests {
         .await
         .expect("historical administrator should be terminable");
 
-        crate::organization::ensure_company_administrator(&pool)
+        crate::application::organization::ensure_company_administrator(&pool)
             .await
             .expect("a replacement administrator should be created");
         repair_default_runtime_task_assignee(&pool, "company-01")
@@ -2569,7 +2569,7 @@ mod tests {
     #[tokio::test]
     async fn records_http_hiring_usage_without_an_agent_job() {
         let pool = test_pool().await;
-        let usage = crate::models::TokenUsageSummary {
+        let usage = crate::domain::models::TokenUsageSummary {
             input_tokens: 17,
             output_tokens: 9,
             cache_tokens: 3,
@@ -2612,7 +2612,7 @@ mod tests {
     #[tokio::test]
     async fn hiring_personalization_falls_back_and_audits_failed_model_call() {
         let pool = test_pool().await;
-        let created = crate::organization::create_hiring_from_message(
+        let created = crate::application::organization::create_hiring_from_message(
             &pool,
             "company-01",
             "hr-01",
@@ -2630,7 +2630,7 @@ mod tests {
         .await
         .expect("test model profile should be changed");
 
-        let result = crate::organization::personalize_hiring_candidates(
+        let result = crate::application::organization::personalize_hiring_candidates(
             &pool,
             "company-01",
             &created.request.id,
@@ -2677,7 +2677,7 @@ mod tests {
     #[tokio::test]
     async fn hired_employee_keeps_candidate_work_style() {
         let pool = test_pool().await;
-        let request = crate::organization::create_hiring_from_message(
+        let request = crate::application::organization::create_hiring_from_message(
             &pool,
             "company-01",
             "hr-01",
@@ -2692,7 +2692,7 @@ mod tests {
             .first()
             .expect("a mock candidate should be available")
             .clone();
-        let workstation = crate::organization::create_workstation(
+        let workstation = crate::application::organization::create_workstation(
             &pool,
             "company-01",
             &request.floor_id,
@@ -2703,7 +2703,7 @@ mod tests {
         )
         .await
         .expect("a workstation should be created");
-        let draft = crate::organization::hire_candidate(
+        let draft = crate::application::organization::hire_candidate(
             &pool,
             "company-01",
             &request.request.id,

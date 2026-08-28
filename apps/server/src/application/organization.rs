@@ -7,14 +7,16 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::{
-    appearance::create_appearance,
-    llm::{self, ChatMessage},
-    model_profiles,
-    models::{
-        CandidateSummary, Employee, FloorRoleSummary, FloorSummary, HiringPositionSummary,
-        HiringRequestSummary, PersonalityProfile, SkillProfile, WorkstationSummary,
+    agent_runtime::llm::{self, ChatMessage},
+    domain::{
+        appearance::create_appearance,
+        models::{
+            CandidateSummary, Employee, FloorRoleSummary, FloorSummary, HiringPositionSummary,
+            HiringRequestSummary, PersonalityProfile, SkillProfile, WorkstationSummary,
+        },
+        office,
     },
-    office,
+    infrastructure::model_profiles,
 };
 
 #[derive(Clone, Debug)]
@@ -97,7 +99,7 @@ pub async fn administrator_patrol(
     current_job_id: &str,
     intervene: bool,
 ) -> Result<AdministratorPatrolResult> {
-    let employees = crate::db::employees(pool, company_id)
+    let employees = crate::infrastructure::db::employees(pool, company_id)
         .await?
         .into_iter()
         .filter(|employee| employee.floor_id.as_deref() == Some(floor_id))
@@ -108,7 +110,7 @@ pub async fn administrator_patrol(
         .map(|employee| employee.id.as_str())
         .collect::<HashSet<_>>();
     let cutoff = Utc::now() - Duration::minutes(15);
-    let jobs = crate::db::jobs(pool, company_id).await?;
+    let jobs = crate::infrastructure::db::jobs(pool, company_id).await?;
     let risky_jobs = jobs
         .iter()
         .filter(|job| employee_ids.contains(job.employee_id.as_str()))
@@ -148,7 +150,8 @@ pub async fn administrator_patrol(
     }
     let mut employee_lines = Vec::new();
     for employee in &employees {
-        let usage = crate::db::employee_token_usage(pool, company_id, &employee.id).await?;
+        let usage =
+            crate::infrastructure::db::employee_token_usage(pool, company_id, &employee.id).await?;
         let active_jobs = jobs
             .iter()
             .filter(|job| job.employee_id == employee.id)
@@ -380,7 +383,12 @@ pub async fn ensure_company_administrator(pool: &SqlitePool) -> Result<()> {
         )
         .await?;
         tx.commit().await?;
-        crate::db::ensure_employee_runtime_binding(pool, &company_id, &administrator_id).await?;
+        crate::infrastructure::db::ensure_employee_runtime_binding(
+            pool,
+            &company_id,
+            &administrator_id,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -865,10 +873,10 @@ pub async fn personalize_hiring_candidates(
         Ok(response) => response,
         Err(_error) => {
             let fallback_reason = FALLBACK_MODEL_REQUEST_FAILED;
-            let empty_usage = crate::models::TokenUsageSummary::default();
-            if let Err(record_error) = crate::db::record_llm_call(
+            let empty_usage = crate::domain::models::TokenUsageSummary::default();
+            if let Err(record_error) = crate::infrastructure::db::record_llm_call(
                 pool,
-                crate::db::LlmCallInput {
+                crate::infrastructure::db::LlmCallInput {
                     company_id,
                     employee_id: &administrator.id,
                     job_id,
@@ -900,9 +908,9 @@ pub async fn personalize_hiring_candidates(
         }
     };
     let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-    if let Err(record_error) = crate::db::record_llm_call(
+    if let Err(record_error) = crate::infrastructure::db::record_llm_call(
         pool,
-        crate::db::LlmCallInput {
+        crate::infrastructure::db::LlmCallInput {
             company_id,
             employee_id: &administrator.id,
             job_id,
@@ -956,7 +964,7 @@ async fn active_company_administrator(
     company_id: &str,
     preferred_id: Option<&str>,
 ) -> Result<Employee> {
-    let employees = crate::db::employees(pool, company_id).await?;
+    let employees = crate::infrastructure::db::employees(pool, company_id).await?;
     if let Some(preferred_id) = preferred_id {
         if let Some(employee) = employees.iter().find(|employee| {
             employee.id == preferred_id
@@ -992,7 +1000,7 @@ struct AiCandidateProfile {
     strengths: Vec<String>,
     weaknesses: Vec<String>,
     expertise: Vec<String>,
-    appearance: crate::models::AppearanceProfile,
+    appearance: crate::domain::models::AppearanceProfile,
     match_score: i64,
     interview_evaluation: String,
 }
@@ -1226,7 +1234,7 @@ fn validate_personality(personality: &PersonalityProfile) -> Result<()> {
     Ok(())
 }
 
-fn validate_appearance(appearance: &crate::models::AppearanceProfile) -> Result<()> {
+fn validate_appearance(appearance: &crate::domain::models::AppearanceProfile) -> Result<()> {
     if !appearance.height_scale.is_finite() || !(0.5..=1.5).contains(&appearance.height_scale) {
         return Err(anyhow!("model returned invalid appearance fields"));
     }
@@ -1436,7 +1444,7 @@ pub async fn employee_for_hire(
     company_id: &str,
     employee_id: &str,
 ) -> Result<Employee> {
-    crate::db::employees(pool, company_id)
+    crate::infrastructure::db::employees(pool, company_id)
         .await?
         .into_iter()
         .find(|employee| employee.id == employee_id)

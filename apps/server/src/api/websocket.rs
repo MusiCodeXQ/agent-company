@@ -2,7 +2,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures_util::StreamExt;
 use tokio::select;
 
-use crate::{app_state::AppState, models::DomainEvent};
+use crate::{app_state::AppState, domain::models::DomainEvent};
 
 pub async fn handle_socket(mut socket: WebSocket, state: AppState, company_id: String) {
     let ready = serde_json::json!({

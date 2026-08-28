@@ -1,33 +1,22 @@
-mod a2a;
-mod adk_runtime;
-mod api;
+pub(crate) mod agent_runtime;
+pub(crate) mod api;
 mod app_state;
-mod appearance;
-mod container_engine;
-mod container_runtime;
-mod db;
-mod events;
-mod llm;
-mod meetings;
-mod model_profiles;
-mod models;
-mod movement;
-mod offboarding;
-mod office;
-mod openclaw;
-mod organization;
-mod runtime;
-mod runtime_store;
-mod spatial;
-mod spatial_commands;
-mod system_logs;
-mod websocket;
+pub(crate) mod application;
+pub(crate) mod domain;
+pub(crate) mod infrastructure;
+pub(crate) mod office;
 
 use std::{env, path::Path};
 
 use tokio::net::TcpListener;
 
-use crate::app_state::AppState;
+use crate::{
+    agent_runtime::{container_engine::should_cleanup_stale_containers, worker},
+    app_state::AppState,
+    application::organization,
+    infrastructure::{db, runtime_store},
+    office::movement,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -46,13 +35,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     organization::ensure_company_administrator(&pool).await?;
     db::repair_default_runtime_task_assignee(&pool, "company-01").await?;
     let state = AppState::new(pool);
-    if state.container_engine.config().enabled {
+    let docker_config = state.container_engine.config();
+    tracing::info!(
+        enabled = docker_config.enabled,
+        keep_containers = docker_config.keep_containers,
+        image = %docker_config.default_image,
+        "loaded employee Docker runtime configuration"
+    );
+    if should_cleanup_stale_containers(docker_config.enabled, docker_config.keep_containers) {
         match state.container_engine.cleanup_stale_containers().await {
             Ok(count) if count > 0 => {
                 tracing::info!(count, "removed stale AI Company execution containers");
             }
             Ok(_) => {}
             Err(error) => tracing::warn!(%error, "could not clean stale execution containers"),
+        }
+    } else if docker_config.enabled {
+        match state.container_engine.cleanup_stale_containers().await {
+            Ok(count) => tracing::info!(
+                stopped_and_retained = count,
+                "completed startup handling for running Docker employee containers before job recovery"
+            ),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "could not stop running Docker employee containers before job recovery; aborting startup"
+                );
+                return Err(error.into());
+            }
         }
     }
     db::recover_running_jobs(&state.pool).await?;
@@ -63,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "recovered interrupted employee runtime runs"
         );
     }
-    runtime::spawn_worker(state.clone());
+    worker::spawn_worker(state.clone());
     movement::spawn_worker(state.clone());
 
     let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());

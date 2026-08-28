@@ -8,12 +8,13 @@ use chrono::{Duration, Utc};
 use serde_json::json;
 
 use crate::{
-    a2a,
     app_state::AppState,
-    db, events,
-    models::{AgentMovementSummary, Employee, MovementPoint},
-    office::{self, LocationDefinition, OfficeLayout, Rect},
-    organization,
+    application::{a2a, organization},
+    domain::{
+        models::{AgentMovementSummary, Employee, MovementPoint},
+        office::{self, LocationDefinition, OfficeLayout, Rect},
+    },
+    infrastructure::{db, events},
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

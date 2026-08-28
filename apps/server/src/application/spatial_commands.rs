@@ -3,7 +3,13 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use serde_json::json;
 
-use crate::{app_state::AppState, db, events, meetings, models::MeetingInput, office, spatial};
+use crate::{
+    app_state::AppState,
+    application::meetings,
+    domain::{models::MeetingInput, office},
+    infrastructure::{db, events},
+    office::navigation as spatial,
+};
 
 /// Deterministic spatial commands understood by the Agent Worker.
 ///
@@ -305,7 +311,7 @@ async fn request_first_available_meeting_seat(
     state: &AppState,
     company_id: &str,
     actor_id: &str,
-) -> Result<crate::models::AgentMovementSummary> {
+) -> Result<crate::domain::models::AgentMovementSummary> {
     let layout = office::default_office();
     let mut last_reservation_error = None;
     for location in layout
@@ -428,7 +434,7 @@ async fn move_if_needed(
     agent_id: &str,
     destination: &str,
     reason: &str,
-) -> Result<Option<crate::models::AgentMovementSummary>> {
+) -> Result<Option<crate::domain::models::AgentMovementSummary>> {
     let employee = employee(state, company_id, agent_id).await?;
     if employee.location_id.as_deref() == Some(destination) && employee.active_movement_id.is_none()
     {
@@ -443,7 +449,7 @@ async fn employee(
     state: &AppState,
     company_id: &str,
     employee_id: &str,
-) -> Result<crate::models::Employee> {
+) -> Result<crate::domain::models::Employee> {
     db::employees(&state.pool, company_id)
         .await?
         .into_iter()

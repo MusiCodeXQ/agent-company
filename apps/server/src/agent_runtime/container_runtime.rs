@@ -3,11 +3,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 
 use crate::{
+    agent_runtime::container_engine::safe_resource_name,
     app_state::AppState,
-    container_engine::safe_resource_name,
-    db,
-    models::RuntimeWorkspaceSummary,
-    runtime_store::{self, RuntimeWorkspaceUpsert},
+    domain::models::RuntimeWorkspaceSummary,
+    infrastructure::{
+        db,
+        runtime_store::{self, RuntimeWorkspaceUpsert},
+    },
 };
 
 const EMPLOYEE_RUNTIME_POLICY: &str = r#"# 员工个人运行环境规则

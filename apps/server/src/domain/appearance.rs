@@ -1,4 +1,4 @@
-use crate::models::AppearanceProfile;
+use crate::domain::models::AppearanceProfile;
 
 struct SeededRng {
     state: u64,

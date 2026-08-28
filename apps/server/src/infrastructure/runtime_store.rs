@@ -2,7 +2,7 @@ use chrono::Utc;
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
 
-use crate::models::{
+use crate::domain::models::{
     RuntimeEnvironmentSuggestionSummary, RuntimeToolApprovalSummary, RuntimeWorkspaceSummary,
     TokenUsageSummary,
 };

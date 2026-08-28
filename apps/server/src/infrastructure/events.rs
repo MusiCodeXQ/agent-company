@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
 
-use crate::{app_state::AppState, models::DomainEvent};
+use crate::{app_state::AppState, domain::models::DomainEvent};
 
 #[derive(Debug, FromRow)]
 struct EventRow {
@@ -141,5 +141,16 @@ fn event_from_row(row: EventRow) -> DomainEvent {
         actor_id: row.actor_id,
         correlation_id: row.correlation_id,
         payload: serde_json::from_str(&row.payload).unwrap_or(Value::Null),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::state_dimensions;
+
+    #[test]
+    fn working_state_turns_on_coding_activity_and_computer() {
+        assert_eq!(state_dimensions("WORKING"), ("CODING", "COMPUTER"));
+        assert_eq!(state_dimensions("THINKING"), ("THINKING", "NONE"));
     }
 }

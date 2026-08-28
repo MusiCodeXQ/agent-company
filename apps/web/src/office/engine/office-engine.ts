@@ -19,6 +19,8 @@ interface DeskView {
   anchorY: number;
 }
 
+const WORK_SCREEN_FRAME_MS = 180;
+
 interface CameraPoint {
   x: number;
   y: number;
@@ -72,6 +74,8 @@ export class OfficeEngine {
   private serverTime: string | null = null;
   private selectedEmployeeId: string | null = null;
   private phoneEmployeeId: string | null = null;
+  private screenClockMs = 0;
+  private renderedWorkFrame = -1;
   private scale = 1;
   private dragging = false;
   private lastPointer = { x: 0, y: 0 };
@@ -240,6 +244,12 @@ export class OfficeEngine {
 
   private update(deltaMs: number): void {
     for (const actor of this.actors.values()) actor.update(deltaMs);
+    this.screenClockMs += Math.max(0, deltaMs);
+    const workFrame = Math.floor(this.screenClockMs / WORK_SCREEN_FRAME_MS);
+    if (workFrame !== this.renderedWorkFrame) {
+      this.renderedWorkFrame = workFrame;
+      this.updateWorkingDeskMonitors(workFrame);
+    }
     this.updateCamera();
   }
 
@@ -705,7 +715,7 @@ export class OfficeEngine {
       ['待命', 0xa5b6be],
       ['看手机', 0xffcf70],
       ['会议中', 0x8bc8ff],
-      ['编码中', 0x72e1b6],
+      ['工作中', 0x72e1b6],
     ];
     items.forEach(([labelText, color], index) => {
       const x = 117 + index * 88;
@@ -723,23 +733,28 @@ export class OfficeEngine {
 
   private updateDeskMonitors(): void {
     const employeeById = new Map(this.employees.map((employee) => [employee.id, employee]));
+    const workFrame = Math.floor(this.screenClockMs / WORK_SCREEN_FRAME_MS);
     for (const view of this.deskViews.values()) {
       const employee = employeeById.get(view.employeeId);
-      const working = employee
-        ? employee.activity === 'CODING' || employee.activity === 'TESTING' || employee.device === 'COMPUTER'
-        : false;
-      const color = employee?.activity === 'TESTING'
-        ? 0x71d7ee
-        : employee?.activity === 'THINKING'
-          ? 0xcab0ff
-          : 0x72e1b6;
-      drawMonitor(view.screen, view.anchorX, view.anchorY, working ? 'work' : 'idle', color);
+      const working = isWorkingEmployee(employee);
+      const color = monitorColor(employee);
+      drawMonitor(view.screen, view.anchorX, view.anchorY, working ? 'work' : 'idle', color, workFrame);
       view.screenLabel.text = working
-        ? employee?.activity === 'TESTING' ? 'TEST' : 'CODE'
+        ? employee?.activity === 'TESTING' ? 'TEST' : 'IDE'
         : 'NEWS';
       view.screenLabel.style.fill = working ? color : 0xd7fbf4;
       view.badgeName.text = employee?.name ?? '未分配';
       view.badgeTitle.text = employee?.title || employee?.role || 'WORKSTATION';
+    }
+    this.renderedWorkFrame = workFrame;
+  }
+
+  private updateWorkingDeskMonitors(workFrame: number): void {
+    const employeeById = new Map(this.employees.map((employee) => [employee.id, employee]));
+    for (const view of this.deskViews.values()) {
+      const employee = employeeById.get(view.employeeId);
+      if (!isWorkingEmployee(employee)) continue;
+      drawMonitor(view.screen, view.anchorX, view.anchorY, 'work', monitorColor(employee), workFrame);
     }
   }
 
@@ -864,6 +879,7 @@ function drawMonitor(
   y: number,
   mode: 'idle' | 'work',
   activeColor: number,
+  phase = 0,
 ): void {
   const working = mode === 'work';
   const screenColor = working ? activeColor : 0x69d6d3;
@@ -884,17 +900,54 @@ function drawMonitor(
     .roundRect(x - 13, y, 26, 3, 1.5)
     .fill(0x5d625a);
   if (working) {
+    const activeLine = phase % 4;
+    const terminalLine = phase % 3;
+    const cursorX = x - 9 + ((phase * 5) % 18);
     graphics
-      .rect(x - 15, y - 31, 16, 2)
-      .fill(0xe8fff7)
-      .rect(x - 15, y - 26, 27, 2)
-      .fill({ color: 0xe8fff7, alpha: 0.8 })
-      .rect(x - 15, y - 21, 10, 2)
-      .fill({ color: activeColor, alpha: 0.95 })
-      .rect(x - 2, y - 21, 14, 2)
-      .fill({ color: 0xe8fff7, alpha: 0.52 })
-      .circle(x + 16, y - 32, 1.4)
+      // IDE chrome and tabs.
+      .rect(x - 18, y - 34, 36, 3)
+      .fill(0x2b3a42)
+      .circle(x - 16, y - 32.5, 0.8)
+      .fill(0xff8076)
+      .circle(x - 13.5, y - 32.5, 0.8)
+      .fill(0xffcf70)
+      .rect(x - 10, y - 33, 11, 1.1)
+      .fill({ color: activeColor, alpha: 0.85 })
+      // File tree.
+      .rect(x - 18, y - 30, 7, 16)
+      .fill({ color: 0x132027, alpha: 0.95 })
+      .rect(x - 16.5, y - 28.5, 3.5, 1.1)
+      .fill({ color: 0x9be4d1, alpha: 0.82 })
+      .rect(x - 16.5, y - 25.5, 4.5, 1.1)
+      .fill({ color: 0x83b5c1, alpha: 0.72 })
+      .rect(x - 16.5, y - 22.5, 3.2, 1.1)
+      .fill({ color: 0x83b5c1, alpha: 0.62 })
+      .rect(x - 16.5, y - 19.5, 4.6, 1.1)
+      .fill({ color: 0x83b5c1, alpha: 0.58 })
+      // Code pane with a deterministic active line and cursor.
+      .rect(x - 10, y - 30, 28, 10)
+      .fill({ color: 0x18252b, alpha: 0.96 })
+      .rect(x - 9, y - 29, 17, 1.5)
+      .fill({ color: activeColor, alpha: activeLine === 0 ? 0.9 : 0.42 })
+      .rect(x - 9, y - 26.5, 22, 1.5)
+      .fill({ color: 0xe8fff7, alpha: activeLine === 1 ? 0.86 : 0.5 })
+      .rect(x - 9, y - 24, 14, 1.5)
+      .fill({ color: 0xf3c77c, alpha: activeLine === 2 ? 0.92 : 0.62 })
+      .rect(x - 6, y - 21.5, 19, 1.5)
+      .fill({ color: 0xe8fff7, alpha: activeLine === 3 ? 0.86 : 0.46 })
+      // Terminal pane and scrolling prompt.
+      .rect(x - 10, y - 19, 28, 6)
+      .fill({ color: 0x0b1518, alpha: 0.98 })
+      .rect(x - 8, y - 17.5, 9 + terminalLine * 2, 1.1)
+      .fill({ color: 0x83d8c1, alpha: 0.78 })
+      .rect(x - 8, y - 15.5, 15 - terminalLine * 2, 1.1)
+      .fill({ color: 0x6c9ea5, alpha: 0.72 })
+      .rect(x - 8, y - 13.5, 5, 1.1)
       .fill(activeColor);
+    if (phase % 2 === 0) {
+      graphics.rect(cursorX, y - 29 + activeLine * 2.5, 1.2, 2).fill(activeColor);
+    }
+    graphics.circle(x + 16, y - 32.5, 1.2).fill(activeColor);
   } else {
     // Static leisure screen: a news/video thumbnail, play button and progress bar.
     // It is deliberately drawn once per state update; there is no frame animation.
@@ -915,6 +968,21 @@ function drawMonitor(
       .rect(x + 6, y - 19, 8, 1.5)
       .fill({ color: 0xe6fff5, alpha: 0.35 });
   }
+}
+
+function isWorkingEmployee(employee: Employee | undefined): boolean {
+  return Boolean(
+    employee
+      && (employee.activity === 'CODING'
+        || employee.activity === 'TESTING'
+        || employee.device === 'COMPUTER'),
+  );
+}
+
+function monitorColor(employee: Employee | undefined): number {
+  if (employee?.activity === 'TESTING') return 0x71d7ee;
+  if (employee?.activity === 'THINKING') return 0xcab0ff;
+  return 0x72e1b6;
 }
 
 function shadeColor(color: number, amount: number): number {

@@ -245,7 +245,11 @@ AI_COMPANY_EMPLOYEE_ROOT=data/employee-runtimes
 AI_COMPANY_EMPLOYEE_CPUS=2
 AI_COMPANY_EMPLOYEE_MEMORY=2g
 AI_COMPANY_EMPLOYEE_PIDS=512
+# 诊断开关，默认 false；true 时停止并保留启动时仍运行的员工容器，不删除已停止容器。
+AI_COMPANY_DOCKER_KEEP_CONTAINERS=false
 ```
+
+排查员工 Runtime 没有文本响应时，可临时设置 `AI_COMPANY_DOCKER_KEEP_CONTAINERS=true` 后重启 server。此时 `docker run` 不会使用 `--rm`，正常成功/失败退出的容器都会保留；15 分钟超时会先尝试 `docker stop --time 5`，失败再尝试 `docker kill`，随后回收 Docker CLI，容器停止后保留。server 启动会只处理仍在运行的托管容器，将其停止并保留；已停止容器不会删除。日志会记录保留模式、员工、run 和容器名，但不会记录 API key。可用 `docker ps -a --filter label=ai-company.managed=true` 查看并在诊断完成后手动删除这些容器，再恢复为 `false`。
 
 然后在“大模型”页面为员工创建个人目录或绑定对应 Runtime。员工目录结构类似：
 

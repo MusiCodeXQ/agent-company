@@ -6,14 +6,15 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::{
+    agent_runtime::{container_engine::RunContainerRequest, container_runtime},
     app_state::AppState,
-    container_engine::RunContainerRequest,
-    container_runtime,
-    db::{self, AgentJob},
-    events,
-    model_profiles::ModelProfileCredentials,
-    models::{Employee, TokenUsageSummary},
-    runtime_store,
+    domain::models::{Employee, TokenUsageSummary},
+    infrastructure::{
+        db::{self, AgentJob},
+        events,
+        model_profiles::ModelProfileCredentials,
+        runtime_store,
+    },
 };
 
 #[derive(Debug, Serialize)]
@@ -145,7 +146,7 @@ pub async fn run_turn(
         &session_id,
     )
     .await?;
-    let content = super::runtime::job_message_content(job);
+    let content = super::worker::job_message_content(job);
     let approval_payload = serde_json::from_str::<Value>(&job.payload).ok();
     let approval_call_id = approval_payload
         .as_ref()

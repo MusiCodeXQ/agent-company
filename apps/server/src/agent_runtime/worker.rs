@@ -4,12 +4,19 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 
 use crate::{
-    a2a, adk_runtime,
+    agent_runtime::{
+        adk as adk_runtime,
+        llm::{self, ChatMessage},
+        openclaw,
+    },
     app_state::AppState,
-    db::{self, AgentJob},
-    events,
-    llm::{self, ChatMessage},
-    model_profiles, offboarding, openclaw, organization, spatial, spatial_commands,
+    application::{a2a, offboarding, organization, spatial_commands},
+    domain::models::RuntimeBindingSummary,
+    infrastructure::{
+        db::{self, AgentJob},
+        events, model_profiles,
+    },
+    office::navigation as spatial,
 };
 
 pub fn spawn_worker(state: AppState) {
@@ -254,6 +261,19 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
         && termination_reply.is_none()
         && patrol_result.is_none()
         && hiring_request.is_none();
+    let prepare_docker_workstation = should_prepare_docker_workstation(
+        requires_workstation,
+        state.container_engine.config().enabled,
+        employee.runtime_binding.as_ref(),
+    );
+    let mut workstation_prepared = false;
+    if prepare_docker_workstation {
+        prepare_workstation(state, job)
+            .await
+            .context("prepare Docker employee workstation")?;
+        workstation_prepared = true;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+    }
     let message = if let Some(message) = existing_message {
         message
     } else {
@@ -358,6 +378,17 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
             }
         };
         if db::job_is_cancelled(&state.pool, &job.id).await? {
+            if workstation_prepared {
+                let _ = events::transition(
+                    state,
+                    &job.company_id,
+                    &job.employee_id,
+                    "IDLE",
+                    job.task_id.as_deref(),
+                    Some(&job.id),
+                )
+                .await;
+            }
             emit_job_state(state, job, "CANCELLED").await?;
             return Ok(());
         }
@@ -431,36 +462,10 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
     {
         tracing::warn!(%error, employee_id = %job.employee_id, "unable to persist agent memory");
     }
-    if requires_workstation {
-        let employee = db::employees(&state.pool, &job.company_id)
-            .await?
-            .into_iter()
-            .find(|employee| employee.id == job.employee_id)
-            .ok_or_else(|| anyhow!("employee {} was not found", job.employee_id))?;
-        let workstation =
-            spatial::employee_workstation_location(state, &job.company_id, &employee).await?;
-        if employee.location_id.as_deref() != Some(workstation.as_str()) {
-            spatial::request_move(
-                state,
-                &job.company_id,
-                &job.employee_id,
-                &workstation,
-                "CODING_LOCATION_REQUIREMENT",
-            )
+    if requires_workstation && !workstation_prepared {
+        prepare_workstation(state, job)
             .await
-            .context("move employee to workstation")?;
-            wait_until_arrived(state, &job.company_id, &job.employee_id, &workstation).await?;
-        }
-        events::transition(
-            state,
-            &job.company_id,
-            &job.employee_id,
-            "WORKING",
-            job.task_id.as_deref(),
-            Some(&job.id),
-        )
-        .await
-        .context("transition employee to WORKING")?;
+            .context("prepare employee workstation")?;
         tokio::time::sleep(Duration::from_millis(350)).await;
     }
     events::transition(
@@ -494,6 +499,74 @@ async fn process_message_job(state: &AppState, job: &AgentJob) -> Result<()> {
     )
     .await?;
     emit_job_state(state, job, "COMPLETED").await?;
+    Ok(())
+}
+
+fn should_prepare_docker_workstation(
+    requires_workstation: bool,
+    container_enabled: bool,
+    binding: Option<&RuntimeBindingSummary>,
+) -> bool {
+    requires_workstation
+        && container_enabled
+        && binding.is_some_and(|binding| {
+            binding.runtime_type == "ADK_RUST"
+                && binding.provision_status == "READY"
+                && binding.runtime_status != "ARCHIVED"
+                && binding.runtime_status != "DISABLED"
+        })
+}
+
+async fn prepare_workstation(state: &AppState, job: &AgentJob) -> Result<()> {
+    let employee = db::employees(&state.pool, &job.company_id)
+        .await?
+        .into_iter()
+        .find(|employee| employee.id == job.employee_id)
+        .ok_or_else(|| anyhow!("employee {} was not found", job.employee_id))?;
+    let workstation =
+        spatial::employee_workstation_location(state, &job.company_id, &employee).await?;
+    let active_movement =
+        db::pending_or_active_movement_for_agent(&state.pool, &job.company_id, &job.employee_id)
+            .await?;
+    if let Some(movement) = active_movement {
+        if movement.to_location_id != workstation {
+            return Err(anyhow!(
+                "employee {} is already moving to {}",
+                job.employee_id,
+                movement.to_location_id
+            ));
+        }
+        wait_until_arrived(state, &job.company_id, &job.employee_id, &workstation).await?;
+    } else if employee.location_id.as_deref() != Some(workstation.as_str()) {
+        spatial::request_move(
+            state,
+            &job.company_id,
+            &job.employee_id,
+            &workstation,
+            "CODING_LOCATION_REQUIREMENT",
+        )
+        .await
+        .context("move employee to workstation")?;
+        wait_until_arrived(state, &job.company_id, &job.employee_id, &workstation).await?;
+    }
+
+    let employee = db::employees(&state.pool, &job.company_id)
+        .await?
+        .into_iter()
+        .find(|employee| employee.id == job.employee_id)
+        .ok_or_else(|| anyhow!("employee {} was not found", job.employee_id))?;
+    if employee.current_state != "WORKING" {
+        events::transition(
+            state,
+            &job.company_id,
+            &job.employee_id,
+            "WORKING",
+            job.task_id.as_deref(),
+            Some(&job.id),
+        )
+        .await
+        .context("transition employee to WORKING")?;
+    }
     Ok(())
 }
 
@@ -656,7 +729,7 @@ pub(crate) async fn generate_reply(state: &AppState, job: &AgentJob) -> Result<S
         match openclaw::run_turn(&binding.runtime_agent_id, &session_key, &runtime_message).await {
             Ok(result) => {
                 let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-                let usage = crate::models::TokenUsageSummary::default();
+                let usage = crate::domain::models::TokenUsageSummary::default();
                 let _ = db::record_llm_call(
                     &state.pool,
                     db::LlmCallInput {
@@ -767,7 +840,7 @@ pub(crate) async fn generate_reply(state: &AppState, job: &AgentJob) -> Result<S
         Err(error) => {
             let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
             let error_text = error.to_string();
-            let empty_usage = crate::models::TokenUsageSummary::default();
+            let empty_usage = crate::domain::models::TokenUsageSummary::default();
             if let Err(record_error) = db::record_llm_call(
                 &state.pool,
                 db::LlmCallInput {
@@ -845,4 +918,61 @@ async fn emit_job_state(state: &AppState, job: &AgentJob, status: &str) -> Resul
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_prepare_docker_workstation;
+    use crate::domain::models::RuntimeBindingSummary;
+
+    fn binding(
+        runtime_type: &str,
+        provision_status: &str,
+        runtime_status: &str,
+    ) -> RuntimeBindingSummary {
+        RuntimeBindingSummary {
+            id: "binding-01".to_string(),
+            employee_id: "employee-01".to_string(),
+            runtime_type: runtime_type.to_string(),
+            runtime_agent_id: "agent-01".to_string(),
+            runtime_profile_id: None,
+            workspace_path: "/tmp/workspace".to_string(),
+            agent_dir: None,
+            provision_status: provision_status.to_string(),
+            runtime_status: runtime_status.to_string(),
+            environment_path: None,
+            artifacts_path: None,
+            last_health_at: None,
+            last_error: None,
+            created_at: "2026-08-13T00:00:00Z".to_string(),
+            updated_at: "2026-08-13T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn prepares_only_ready_active_adk_work_for_enabled_docker() {
+        let adk = binding("ADK_RUST", "READY", "ACTIVE");
+        assert!(should_prepare_docker_workstation(true, true, Some(&adk)));
+
+        // Meetings, spatial commands and structured/special replies do not ask
+        // for a workstation, even when the employee has a Docker runtime.
+        assert!(!should_prepare_docker_workstation(false, true, Some(&adk)));
+        assert!(!should_prepare_docker_workstation(true, false, Some(&adk)));
+        assert!(!should_prepare_docker_workstation(true, true, None));
+
+        let mock = binding("MOCK", "READY", "ACTIVE");
+        let archived = binding("ADK_RUST", "READY", "ARCHIVED");
+        let pending = binding("ADK_RUST", "PENDING", "ACTIVE");
+        assert!(!should_prepare_docker_workstation(true, true, Some(&mock)));
+        assert!(!should_prepare_docker_workstation(
+            true,
+            true,
+            Some(&archived)
+        ));
+        assert!(!should_prepare_docker_workstation(
+            true,
+            true,
+            Some(&pending)
+        ));
+    }
 }

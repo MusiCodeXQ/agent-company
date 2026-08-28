@@ -4,8 +4,8 @@ use sqlx::SqlitePool;
 use tokio::sync::{broadcast, Mutex, Notify};
 
 use crate::{
-    container_engine::{ContainerEngine, DockerCliEngine},
-    models::DomainEvent,
+    agent_runtime::container_engine::{ContainerEngine, DockerCliEngine},
+    domain::models::DomainEvent,
 };
 
 #[derive(Clone)]

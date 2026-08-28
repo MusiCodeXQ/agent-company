@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
 
-use crate::models::{ModelProfileInput, ModelProfileSummary, ModelProfileUpdate};
+use crate::domain::models::{ModelProfileInput, ModelProfileSummary, ModelProfileUpdate};
 
 #[derive(Clone, Debug, FromRow)]
 struct ModelProfileRow {

@@ -8,9 +8,12 @@ use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
-    db, events,
-    models::{MeetingInput, MeetingSummary},
-    office, spatial,
+    domain::{
+        models::{MeetingInput, MeetingSummary},
+        office,
+    },
+    infrastructure::{db, events},
+    office::navigation as spatial,
 };
 
 pub async fn create(

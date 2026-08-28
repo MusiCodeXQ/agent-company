@@ -3,7 +3,11 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::json;
 
-use crate::{a2a, app_state::AppState, db, events, meetings, offboarding};
+use crate::{
+    app_state::AppState,
+    application::{a2a, meetings, offboarding},
+    infrastructure::{db, events},
+};
 
 pub fn spawn_worker(state: AppState) {
     tokio::spawn(async move {

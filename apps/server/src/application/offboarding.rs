@@ -5,12 +5,17 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::{
+    agent_runtime::{container_runtime, openclaw},
     app_state::AppState,
-    container_runtime, db,
-    db::MovementArrival,
-    events,
-    models::{Employee, TerminationPreview, TerminationRecordSummary, TerminationTaskSummary},
-    office, openclaw, spatial,
+    domain::{
+        models::{Employee, TerminationPreview, TerminationRecordSummary, TerminationTaskSummary},
+        office,
+    },
+    infrastructure::{
+        db::{self, MovementArrival},
+        events,
+    },
+    office::navigation as spatial,
 };
 
 const ACTIVE_TASK_STATUSES: &str = "('PENDING', 'READY', 'IN_PROGRESS', 'WAITING', 'RUNNING')";

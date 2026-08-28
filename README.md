@@ -237,7 +237,11 @@ AI_COMPANY_EMPLOYEE_ROOT=data/employee-runtimes
 AI_COMPANY_EMPLOYEE_CPUS=2
 AI_COMPANY_EMPLOYEE_MEMORY=2g
 AI_COMPANY_EMPLOYEE_PIDS=512
+# Diagnostic switch, default false; true stops and retains running startup containers without removing stopped ones.
+AI_COMPANY_DOCKER_KEEP_CONTAINERS=false
 ```
+
+When diagnosing an employee Runtime that produces no text response, temporarily set `AI_COMPANY_DOCKER_KEEP_CONTAINERS=true` and restart the server. Docker runs omit `--rm`, successful/failed exits retain the stopped container, and a 15-minute timeout first tries `docker stop --time 5`, falls back to `docker kill`, then reaps the Docker CLI while retaining the stopped container. Startup handles only still-running managed containers by stopping and retaining them; already-stopped containers are not removed. Logs include the retention mode, employee, run, and container name, but never API keys. Inspect retained containers with `docker ps -a --filter label=ai-company.managed=true`, remove them manually after diagnosis, and set the flag back to `false`.
 
 Then create an employee directory or bind the relevant runtime from the Models page. A directory looks like this:
 

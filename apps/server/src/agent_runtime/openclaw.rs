@@ -12,7 +12,7 @@ use tokio::process::Command;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 
-use crate::models::{Employee, OpenClawStatus};
+use crate::domain::models::{Employee, OpenClawStatus};
 
 const DEFAULT_GATEWAY_URL: &str = "ws://127.0.0.1:18789";
 const DEFAULT_PROTOCOL_VERSION: i64 = 4;

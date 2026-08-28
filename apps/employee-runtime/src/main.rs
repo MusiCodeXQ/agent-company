@@ -10,8 +10,9 @@ use uuid::Uuid;
 
 use adk_agent::LlmAgentBuilder;
 use adk_core::{
-    AdkError, Agent, CallbackContext, Content, ErrorCategory, ErrorComponent, Llm, LlmRequest,
-    LlmResponse, Part, RunConfig, SessionId, Tool, ToolConfirmationDecision, ToolContext, UserId,
+    AdkError, Agent, CallbackContext, Content, ErrorCategory, ErrorComponent,
+    GenerateContentConfig, Llm, LlmRequest, LlmResponse, Part, RunConfig, SessionId, Tool,
+    ToolConfirmationDecision, ToolContext, UserId,
 };
 use adk_devtools::{DevToolset, Workspace};
 use adk_model::{OpenAIClient, OpenAIConfig};
@@ -36,6 +37,7 @@ const FILE_OPERATION_INSTRUCTIONS: &str = "\
 - 修改 /workspace 中已有文件必须先调用 read_file，再调用 edit_file；不要盲目覆盖已有内容。
 - 禁止使用 bash、cat、tee、printf、Shell 重定向（>、>>）、heredoc 或其他 Shell 技巧直接创建或修改 /workspace 中的文件。
 - bash 默认仅用于测试、构建、诊断和检查状态等确实需要 Shell 的操作，不要把它当作 /workspace 的文件编辑工具；受限 Docker 挂载目录的例外规则见下方。
+- 每次工具操作完成后必须向用户输出一句简短确认，说明实际完成的操作；不要只依赖工具结果或假设用户能看到工具日志。
 ";
 
 const CONTAINER_RUNTIME_INSTRUCTIONS: &str = "\
@@ -269,6 +271,58 @@ struct PersonalToolchainRecord {
     install_path: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SuccessfulToolResult {
+    FileWrite { path: String },
+    Bash,
+    PersonalToolchainRecorded { name: String },
+    BaseImagePackageRecommended { package_name: String },
+}
+
+#[derive(Default)]
+struct ToolCompletionState {
+    successful_results: Vec<SuccessfulToolResult>,
+    next_result_sequence: u64,
+    last_failed_result_sequence: Option<u64>,
+    last_successful_completion_sequence: Option<u64>,
+}
+
+impl ToolCompletionState {
+    fn record(&mut self, tool_name: &str, response: &Value) {
+        self.next_result_sequence += 1;
+        let sequence = self.next_result_sequence;
+        if let Some(success) = successful_tool_result(tool_name, response) {
+            self.last_successful_completion_sequence = Some(sequence);
+            self.successful_results.push(success);
+        } else if is_completion_tool(tool_name) || failed_tool_result(response) {
+            self.last_failed_result_sequence = Some(sequence);
+        }
+    }
+
+    fn can_confirm(&self) -> bool {
+        let Some(last_successful) = self.last_successful_completion_sequence else {
+            return false;
+        };
+        self.last_failed_result_sequence
+            .is_none_or(|last_failed| last_successful > last_failed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenAiCompatibilityPreset {
+    Generic,
+    MiMo,
+}
+
+impl OpenAiCompatibilityPreset {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::MiMo => "mimo",
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() != Some("run") {
@@ -308,11 +362,21 @@ async fn run(
     ) {
         return Err(anyhow!("ADK runtime requires an OpenAI-compatible model"));
     }
-    let model: Arc<dyn Llm> = Arc::new(OpenAIClient::new(OpenAIConfig::compatible(
-        request.model.api_key.unwrap_or_default(),
-        request.model.base_url,
-        request.model.model,
-    ))?);
+    let compatibility = resolve_openai_compatibility(&request.model.base_url, &request.model.model);
+    let model_name = request.model.model.clone();
+    let model: Arc<dyn Llm> = Arc::new(
+        OpenAIClient::new(OpenAIConfig::compatible(
+            request.model.api_key.unwrap_or_default(),
+            request.model.base_url,
+            request.model.model,
+        ))
+        .with_context(|| {
+            format!(
+                "create OpenAI-compatible model (compatibility={}, model={model_name})",
+                compatibility.as_str()
+            )
+        })?,
+    );
     // The server's explicit request marker is the sole authority for the
     // reduced-confirmation Docker path. Never infer isolation from a mutable
     // process environment variable.
@@ -325,6 +389,9 @@ async fn run(
         .tool_timeout(Duration::from_secs(120))
         .circuit_breaker_threshold(3)
         .enhanced_plugin(Arc::new(GovernancePlugin));
+    if let Some(config) = generate_content_config(compatibility) {
+        builder = builder.generate_content_config(config);
+    }
     if request.allow_tools {
         let workspace = Workspace::new("/workspace")
             .writable(true)
@@ -434,6 +501,7 @@ async fn run(
     let mut sequence = 0_u64;
     let mut waiting_for_approval = false;
     let mut pending_environment_changes: HashMap<String, Vec<EnvironmentChange>> = HashMap::new();
+    let mut tool_completion_state = ToolCompletionState::default();
     let started_event = RuntimeEvent {
         schema_version: 1,
         event_id: format!("runtime-event-{}", Uuid::new_v4()),
@@ -564,6 +632,7 @@ async fn run(
             response.events.push(started_event);
         }
         for result in event.tool_results() {
+            tool_completion_state.record(result.name, result.response);
             if result.name == "company_recommend_base_image_package"
                 || result.response.get("exit_code").and_then(Value::as_i64) == Some(0)
             {
@@ -625,15 +694,7 @@ async fn run(
         if event.is_final_response()
             && let Some(content) = &event.llm_response.content
         {
-            response.content = content
-                .parts
-                .iter()
-                .filter_map(|part| match part {
-                    Part::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
+            response.content = extract_text(content);
         }
     }
     if waiting_for_approval {
@@ -661,7 +722,13 @@ async fn run(
         return Ok(response);
     }
     if response.content.trim().is_empty() {
-        return Err(anyhow!("ADK runtime completed without a text response"));
+        let Some(confirmation) = tool_completion_confirmation(&tool_completion_state) else {
+            return Err(anyhow!(
+                "ADK runtime completed without a text response (compatibility={}, model={model_name})",
+                compatibility.as_str()
+            ));
+        };
+        response.content = confirmation;
     }
     let runtime_event = RuntimeEvent {
         schema_version: 1,
@@ -689,6 +756,252 @@ async fn run(
 fn next_sequence(sequence: &mut u64) -> u64 {
     *sequence = sequence.saturating_add(1);
     *sequence
+}
+
+fn resolve_openai_compatibility(base_url: &str, model: &str) -> OpenAiCompatibilityPreset {
+    if base_url_host(base_url).as_deref().is_some_and(is_mimo_host) || is_mimo_model(model) {
+        OpenAiCompatibilityPreset::MiMo
+    } else {
+        OpenAiCompatibilityPreset::Generic
+    }
+}
+
+fn generate_content_config(
+    compatibility: OpenAiCompatibilityPreset,
+) -> Option<GenerateContentConfig> {
+    if compatibility == OpenAiCompatibilityPreset::Generic {
+        return None;
+    }
+
+    let mut openai_extensions = serde_json::Map::new();
+    openai_extensions.insert(
+        "thinking".to_string(),
+        serde_json::json!({"type": "disabled"}),
+    );
+    openai_extensions.insert("tool_choice".to_string(), serde_json::json!("auto"));
+
+    let mut extensions = serde_json::Map::new();
+    extensions.insert(
+        "openai".to_string(),
+        serde_json::Value::Object(openai_extensions),
+    );
+    Some(GenerateContentConfig {
+        extensions,
+        ..Default::default()
+    })
+}
+
+fn base_url_host(base_url: &str) -> Option<String> {
+    let authority = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, remainder)| remainder)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = authority
+        .strip_prefix('[')
+        .and_then(|value| value.split(']').next())
+        .or_else(|| authority.split(':').next())
+        .unwrap_or_default()
+        .trim_end_matches('.')
+        .trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+fn is_mimo_host(host: &str) -> bool {
+    host == "xiaomimimo.com" || host.ends_with(".xiaomimimo.com")
+}
+
+fn is_mimo_model(model: &str) -> bool {
+    model
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| part.eq_ignore_ascii_case("mimo"))
+}
+
+fn failed_tool_result(response: &Value) -> bool {
+    response.get("error").is_some()
+        || response
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .is_some_and(|exit_code| exit_code != 0)
+}
+
+fn is_completion_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "write_file"
+            | "edit_file"
+            | "bash"
+            | "company_record_personal_toolchain"
+            | "company_recommend_base_image_package"
+    )
+}
+
+fn successful_tool_result(tool_name: &str, response: &Value) -> Option<SuccessfulToolResult> {
+    if failed_tool_result(response) {
+        return None;
+    }
+
+    match tool_name {
+        "write_file" => successful_file_write_result(response, "bytes_written"),
+        "edit_file" => successful_file_write_result(response, "replacements"),
+        "bash" if response.get("exit_code").and_then(Value::as_i64) == Some(0) => {
+            Some(SuccessfulToolResult::Bash)
+        }
+        "company_record_personal_toolchain" => successful_personal_toolchain_result(response),
+        "company_recommend_base_image_package" => successful_base_image_package_result(response),
+        _ => None,
+    }
+}
+
+fn successful_personal_toolchain_result(response: &Value) -> Option<SuccessfulToolResult> {
+    if response.get("recorded").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let toolchain = response.get("toolchain")?.as_object()?;
+    let name = toolchain
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())?;
+    toolchain
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|version| !version.is_empty())?;
+    toolchain
+        .get("installPath")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|install_path| !install_path.is_empty())?;
+    Some(SuccessfulToolResult::PersonalToolchainRecorded {
+        name: name.to_string(),
+    })
+}
+
+fn successful_base_image_package_result(response: &Value) -> Option<SuccessfulToolResult> {
+    if response.get("recommended").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let package_name = response
+        .get("packageName")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|package_name| !package_name.is_empty())?;
+    Some(SuccessfulToolResult::BaseImagePackageRecommended {
+        package_name: package_name.to_string(),
+    })
+}
+
+fn successful_file_write_result(
+    response: &Value,
+    completion_field: &str,
+) -> Option<SuccessfulToolResult> {
+    let path = response
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .and_then(safe_relative_path)?;
+    response.get(completion_field).and_then(Value::as_u64)?;
+    Some(SuccessfulToolResult::FileWrite { path })
+}
+
+fn safe_relative_path(path: &str) -> Option<String> {
+    let path = Path::new(path);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || path.to_string_lossy().chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(path.display().to_string())
+}
+
+fn tool_completion_confirmation(state: &ToolCompletionState) -> Option<String> {
+    if !state.can_confirm() {
+        return None;
+    }
+
+    let mut paths = Vec::new();
+    let mut bash_succeeded = false;
+    let mut toolchain_names = Vec::new();
+    let mut base_image_packages = Vec::new();
+    for result in &state.successful_results {
+        match result {
+            SuccessfulToolResult::FileWrite { path } if !paths.contains(path) => {
+                paths.push(path.clone());
+            }
+            SuccessfulToolResult::FileWrite { .. } => {}
+            SuccessfulToolResult::Bash => bash_succeeded = true,
+            SuccessfulToolResult::PersonalToolchainRecorded { name }
+                if !toolchain_names.contains(name) =>
+            {
+                toolchain_names.push(name.clone());
+            }
+            SuccessfulToolResult::PersonalToolchainRecorded { .. } => {}
+            SuccessfulToolResult::BaseImagePackageRecommended { package_name }
+                if !base_image_packages.contains(package_name) =>
+            {
+                base_image_packages.push(package_name.clone());
+            }
+            SuccessfulToolResult::BaseImagePackageRecommended { .. } => {}
+        }
+    }
+
+    if paths.is_empty()
+        && !bash_succeeded
+        && toolchain_names.len() == 1
+        && base_image_packages.is_empty()
+    {
+        return Some(format!("已记录个人工具链：{}。", toolchain_names[0]));
+    }
+    if paths.is_empty()
+        && !bash_succeeded
+        && toolchain_names.is_empty()
+        && base_image_packages.len() == 1
+    {
+        return Some(format!(
+            "已提交基础镜像包建议：{}。",
+            base_image_packages[0]
+        ));
+    }
+    if let [path] = paths.as_slice()
+        && !bash_succeeded
+    {
+        return Some(format!("已完成文件写入：{path}。"));
+    }
+    if !paths.is_empty() && !bash_succeeded {
+        return Some(format!("已完成文件写入：{} 个文件。", paths.len()));
+    }
+    if paths.is_empty() && bash_succeeded {
+        return Some("工具操作已完成，命令执行成功。".to_string());
+    }
+    if bash_succeeded {
+        return Some("工具操作已完成，文件已写入且命令执行成功。".to_string());
+    }
+    Some("工具操作已完成。".to_string())
+}
+
+fn extract_text(content: &Content) -> String {
+    content
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 async fn record_personal_toolchain(args: &Value) -> Result<Value, adk_core::AdkError> {
@@ -917,12 +1230,15 @@ fn default_run_status() -> String {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use adk_core::{Content, Part};
     use serde_json::json;
 
     use super::{
-        PersonalToolchainRecord, RunRequest, bash_requires_confirmation, environment_changes,
-        record_personal_toolchain_at, redact_arguments, run_started_arguments, runtime_instruction,
-        safe_identity,
+        OpenAiCompatibilityPreset, PersonalToolchainRecord, RunRequest, ToolCompletionState,
+        bash_requires_confirmation, environment_changes, extract_text, generate_content_config,
+        record_personal_toolchain_at, redact_arguments, resolve_openai_compatibility,
+        run_started_arguments, runtime_instruction, safe_identity, successful_tool_result,
+        tool_completion_confirmation,
     };
 
     #[test]
@@ -932,6 +1248,7 @@ mod tests {
         assert!(instruction.contains("write_file"));
         assert!(instruction.contains("edit_file"));
         assert!(instruction.contains("Markdown"));
+        assert!(instruction.contains("每次工具操作完成后必须向用户输出一句简短确认"));
         assert!(instruction.contains("禁止使用 bash、cat、tee"));
         assert!(instruction.contains("/workspace、/agent-state、/artifacts、/home/employee"));
         assert!(
@@ -1000,6 +1317,70 @@ mod tests {
     }
 
     #[test]
+    fn resolves_mimo_from_provider_host_or_model_without_marking_generic_models() {
+        assert_eq!(
+            resolve_openai_compatibility("https://api.xiaomimimo.com/v1", "mimo-v2.5"),
+            OpenAiCompatibilityPreset::MiMo
+        );
+        assert_eq!(
+            resolve_openai_compatibility("https://example.com/v1", "MiMo-V2.5-Flash"),
+            OpenAiCompatibilityPreset::MiMo
+        );
+        assert_eq!(
+            resolve_openai_compatibility("https://xiaomimimo.com.evil.example/v1", "gpt-4o"),
+            OpenAiCompatibilityPreset::Generic
+        );
+        assert_eq!(
+            resolve_openai_compatibility("https://api.example.com/v1", "minimax-m2.7"),
+            OpenAiCompatibilityPreset::Generic
+        );
+        assert_eq!(
+            resolve_openai_compatibility("https://api.example.com/v1", "gpt-4o"),
+            OpenAiCompatibilityPreset::Generic
+        );
+    }
+
+    #[test]
+    fn mimo_config_contains_only_openai_wire_compatibility_fields() {
+        let config = generate_content_config(OpenAiCompatibilityPreset::MiMo)
+            .expect("MiMo should receive an OpenAI compatibility config");
+        let openai = config
+            .extensions
+            .get("openai")
+            .and_then(serde_json::Value::as_object)
+            .expect("OpenAI extension should be an object");
+        assert_eq!(openai["thinking"], serde_json::json!({"type": "disabled"}));
+        assert_eq!(openai["tool_choice"], "auto");
+        assert_eq!(openai.len(), 2);
+    }
+
+    #[test]
+    fn generic_config_is_absent_and_legacy_requests_stay_compatible() {
+        assert!(generate_content_config(OpenAiCompatibilityPreset::Generic).is_none());
+
+        let request: RunRequest = serde_json::from_value(json!({
+            "companyId": "company-01",
+            "runId": "run-01",
+            "agentJobId": "job-01",
+            "employeeId": "employee-01",
+            "sessionId": "session-01",
+            "systemPrompt": "test",
+            "content": "test",
+            "model": {
+                "protocol": "openai_compatible",
+                "baseUrl": "https://api.example.com/v1",
+                "model": "gpt-4o"
+            }
+        }))
+        .expect("legacy request without compatibility fields should decode");
+        assert!(request.model.api_key.is_none());
+        assert_eq!(
+            resolve_openai_compatibility(&request.model.base_url, &request.model.model),
+            OpenAiCompatibilityPreset::Generic
+        );
+    }
+
+    #[test]
     fn extracts_environment_install_suggestions() {
         let changes =
             environment_changes("bash", &json!({"command": "pip install ruff==0.12 pytest"}));
@@ -1016,6 +1397,320 @@ mod tests {
             redact_arguments(json!({"api_key": "secret"}))["api_key"],
             "[REDACTED]"
         );
+    }
+
+    #[test]
+    fn successful_write_file_result_has_user_visible_confirmation() {
+        let result = successful_tool_result(
+            "write_file",
+            &json!({
+                "path": "docs/README.md",
+                "bytes_written": 128,
+                "message": "Wrote 128 bytes to docs/README.md"
+            }),
+        )
+        .expect("write_file result should be recognized as successful");
+        let mut state = ToolCompletionState::default();
+        state.record(
+            "write_file",
+            &json!({
+                "path": "docs/README.md",
+                "bytes_written": 128,
+                "message": "Wrote 128 bytes to docs/README.md"
+            }),
+        );
+        assert_eq!(
+            tool_completion_confirmation(&state),
+            Some("已完成文件写入：docs/README.md。".to_string())
+        );
+        assert!(matches!(
+            result,
+            super::SuccessfulToolResult::FileWrite { .. }
+        ));
+    }
+
+    #[test]
+    fn successful_edit_file_result_has_user_visible_confirmation() {
+        let result = successful_tool_result(
+            "edit_file",
+            &json!({
+                "path": "docs/README.md",
+                "replacements": 2,
+                "message": "Replaced 2 occurrence(s) in docs/README.md"
+            }),
+        )
+        .expect("edit_file result should be recognized as successful");
+        let mut state = ToolCompletionState::default();
+        state.record(
+            "edit_file",
+            &json!({
+                "path": "docs/README.md",
+                "replacements": 2,
+                "message": "Replaced 2 occurrence(s) in docs/README.md"
+            }),
+        );
+        assert_eq!(
+            tool_completion_confirmation(&state),
+            Some("已完成文件写入：docs/README.md。".to_string())
+        );
+        assert!(matches!(
+            result,
+            super::SuccessfulToolResult::FileWrite { .. }
+        ));
+        assert!(
+            successful_tool_result(
+                "edit_file",
+                &json!({"path": "../outside.md", "replacements": 1})
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn successful_bash_result_has_user_visible_confirmation() {
+        let result = successful_tool_result(
+            "bash",
+            &json!({"command": "cargo test", "exit_code": 0, "stdout": "ok"}),
+        )
+        .expect("successful bash result should be recognized");
+        let mut state = ToolCompletionState::default();
+        state.record(
+            "bash",
+            &json!({"command": "cargo test", "exit_code": 0, "stdout": "ok"}),
+        );
+        assert_eq!(
+            tool_completion_confirmation(&state),
+            Some("工具操作已完成，命令执行成功。".to_string())
+        );
+        assert!(matches!(result, super::SuccessfulToolResult::Bash));
+    }
+
+    #[test]
+    fn successful_company_tools_have_user_visible_confirmation() {
+        let toolchain = successful_tool_result(
+            "company_record_personal_toolchain",
+            &json!({
+                "recorded": true,
+                "toolchain": {
+                    "name": "rust",
+                    "version": "1.80.0",
+                    "installPath": "/home/employee/.local/rust"
+                }
+            }),
+        )
+        .expect("successful toolchain record should be recognized");
+        let mut toolchain_state = ToolCompletionState::default();
+        toolchain_state.record(
+            "company_record_personal_toolchain",
+            &json!({
+                "recorded": true,
+                "toolchain": {
+                    "name": "rust",
+                    "version": "1.80.0",
+                    "installPath": "/home/employee/.local/rust"
+                }
+            }),
+        );
+        assert_eq!(
+            tool_completion_confirmation(&toolchain_state),
+            Some("已记录个人工具链：rust。".to_string())
+        );
+        assert!(matches!(
+            toolchain,
+            super::SuccessfulToolResult::PersonalToolchainRecorded { .. }
+        ));
+
+        let package = successful_tool_result(
+            "company_recommend_base_image_package",
+            &json!({"recommended": true, "packageName": "libssl-dev"}),
+        )
+        .expect("successful base image recommendation should be recognized");
+        let mut package_state = ToolCompletionState::default();
+        package_state.record(
+            "company_recommend_base_image_package",
+            &json!({"recommended": true, "packageName": "libssl-dev"}),
+        );
+        assert_eq!(
+            tool_completion_confirmation(&package_state),
+            Some("已提交基础镜像包建议：libssl-dev。".to_string())
+        );
+        assert!(matches!(
+            package,
+            super::SuccessfulToolResult::BaseImagePackageRecommended { .. }
+        ));
+    }
+
+    #[test]
+    fn failed_company_tools_and_successful_reads_do_not_fall_back_to_confirmation() {
+        assert!(
+            successful_tool_result(
+                "company_record_personal_toolchain",
+                &json!({
+                    "error": "manifest write failed",
+                    "recorded": true,
+                    "toolchain": {
+                        "name": "rust",
+                        "version": "1.80.0",
+                        "installPath": "/home/employee/.local/rust"
+                    }
+                })
+            )
+            .is_none()
+        );
+        assert!(
+            successful_tool_result(
+                "company_recommend_base_image_package",
+                &json!({"recommended": false, "packageName": "libssl-dev"})
+            )
+            .is_none()
+        );
+
+        for (tool_name, response) in [
+            ("read_file", json!({"content": "file contents"})),
+            ("glob", json!({"matches": ["src/main.rs"]})),
+            ("grep", json!({"matches": [{"path": "src/main.rs"}]})),
+        ] {
+            assert!(
+                successful_tool_result(tool_name, &response).is_none(),
+                "{tool_name} should not imply task completion"
+            );
+        }
+        assert!(tool_completion_confirmation(&ToolCompletionState::default()).is_none());
+    }
+
+    #[test]
+    fn errors_and_non_successful_or_unknown_results_do_not_count() {
+        assert!(successful_tool_result("write_file", &json!({"error": "denied"})).is_none());
+        assert!(
+            successful_tool_result("bash", &json!({"exit_code": 1, "stderr": "failed"})).is_none()
+        );
+        assert!(successful_tool_result("read_file", &json!({})).is_none());
+        assert!(tool_completion_confirmation(&ToolCompletionState::default()).is_none());
+    }
+
+    #[test]
+    fn failed_edit_read_successful_edit_can_fall_back_to_confirmation() {
+        let mut state = ToolCompletionState::default();
+        state.record(
+            "edit_file",
+            &json!({"error": "read_file must be called before edit_file"}),
+        );
+        state.record("read_file", &json!({"content": "before"}));
+        state.record(
+            "edit_file",
+            &json!({"path": "docs/README.md", "replacements": 1}),
+        );
+
+        assert_eq!(state.last_failed_result_sequence, Some(1));
+        assert_eq!(state.last_successful_completion_sequence, Some(3));
+        assert_eq!(
+            tool_completion_confirmation(&state),
+            Some("已完成文件写入：docs/README.md。".to_string())
+        );
+    }
+
+    #[test]
+    fn successful_write_followed_by_malformed_bash_does_not_fall_back() {
+        for response in [
+            json!({"exit_code": null}),
+            json!({}),
+            json!({"signal": "SIGTERM"}),
+            json!({"exit_code": 1, "stderr": "command failed"}),
+        ] {
+            let mut state = ToolCompletionState::default();
+            state.record(
+                "write_file",
+                &json!({"path": "docs/README.md", "bytes_written": 128}),
+            );
+            state.record("bash", &response);
+
+            assert_eq!(state.last_successful_completion_sequence, Some(1));
+            assert_eq!(state.last_failed_result_sequence, Some(2));
+            assert_eq!(tool_completion_confirmation(&state), None);
+        }
+    }
+
+    #[test]
+    fn malformed_completion_results_block_previous_success() {
+        for (tool_name, response) in [
+            (
+                "edit_file",
+                json!({"path": "docs/README.md", "replacements": null}),
+            ),
+            (
+                "company_record_personal_toolchain",
+                json!({
+                    "recorded": true,
+                    "toolchain": {"name": "rust", "version": "1.80.0"}
+                }),
+            ),
+            (
+                "company_recommend_base_image_package",
+                json!({"recommended": true}),
+            ),
+        ] {
+            assert!(successful_tool_result(tool_name, &response).is_none());
+
+            let mut state = ToolCompletionState::default();
+            state.record(
+                "write_file",
+                &json!({"path": "docs/README.md", "bytes_written": 128}),
+            );
+            state.record(tool_name, &response);
+            assert_eq!(tool_completion_confirmation(&state), None);
+        }
+    }
+
+    #[test]
+    fn failed_tool_only_does_not_fall_back_to_confirmation() {
+        let mut state = ToolCompletionState::default();
+        state.record(
+            "edit_file",
+            &json!({"error": "read_file must be called before edit_file"}),
+        );
+
+        assert_eq!(state.last_successful_completion_sequence, None);
+        assert_eq!(state.last_failed_result_sequence, Some(1));
+        assert_eq!(tool_completion_confirmation(&state), None);
+    }
+
+    #[test]
+    fn successful_reads_do_not_clear_failure_and_unknown_errors_remain_failures() {
+        let mut state = ToolCompletionState::default();
+        state.record(
+            "edit_file",
+            &json!({"error": "read_file must be called before edit_file"}),
+        );
+        state.record("read_file", &json!({"content": "before"}));
+        assert_eq!(state.last_failed_result_sequence, Some(1));
+        assert_eq!(state.last_successful_completion_sequence, None);
+
+        state.record("unknown_tool", &json!({"error": "tool failed"}));
+        assert_eq!(state.last_failed_result_sequence, Some(3));
+        assert_eq!(tool_completion_confirmation(&state), None);
+    }
+
+    #[test]
+    fn extracts_only_visible_text_parts() {
+        let content = Content {
+            role: "model".to_string(),
+            parts: vec![
+                Part::Thinking {
+                    thinking: "hidden reasoning".to_string(),
+                    signature: None,
+                },
+                Part::Text {
+                    text: "已完成".to_string(),
+                },
+                Part::FunctionCall {
+                    name: "write_file".to_string(),
+                    args: json!({"path": "docs/README.md"}),
+                    id: Some("call-1".to_string()),
+                    thought_signature: None,
+                },
+            ],
+        };
+        assert_eq!(extract_text(&content), "已完成");
     }
 
     #[tokio::test]
